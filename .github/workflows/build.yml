@@ -1,0 +1,15 @@
+# Map.ipa on a macOS runner (Xcode's clang and SDK), kept as the run's artifact: on every push, and by hand.
+name: build
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Map-ipa
+          path: build/Map.ipa
