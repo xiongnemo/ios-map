@@ -1,0 +1,25 @@
+/* the map's own words in Chinese */
+"Copy" = "复制";
+"Copied" = "已复制";
+"Dropped pin" = "放置的图钉";
+"Search places" = "搜索地点";
+"Searching…" = "正在搜索…";
+"No places found" = "没有找到地点";
+"Map Settings" = "地图设置";
+"Renderer" = "渲染器";
+"Style" = "样式";
+"Follow System" = "跟随系统";
+"System" = "跟随系统";
+"Light" = "浅色";
+"Dark" = "深色";
+"Place Names" = "地名语言";
+"Local" = "当地名";
+"Chinese" = "中文优先";
+"English" = "英文优先";
+"Show Frame Rate" = "显示帧率";
+"Done" = "完成";
+"Drawing with %@." = "正在用 %@ 绘制。";
+"Metal: %@." = "Metal：%@。";
+"Metal is not available to this app on this device" = "这台设备上，这个 App 用不了 Metal";
+"North up" = "转回正北";
+"Settings" = "设置";

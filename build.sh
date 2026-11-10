@@ -23,15 +23,23 @@ rm -rf "$OUT/Payload" "$OUT/Map.ipa"
 mkdir -p "$APP"
 # (-target, not -arch and -miphoneos-version-min: a wrapper such as xnu-clang puts its own -target ios16.5 first, which
 # wins over -miphoneos-version-min, and the program would then ask for iOS 16.5; the last -target is the one that counts)
-$CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O1 -fobjc-arc \
+# OpenGLES is linked, not weakly: it is one of the two renderers, and the K40 port gives an application its own OpenGL ES
+# only if it links the framework. Metal is weak: without it (an old device) the map draws with OpenGL ES.
+$CC -target arm64-apple-ios15.0 -isysroot "$SDK" -O2 -fobjc-arc -Wall -Wno-unused-parameter \
 	-framework UIKit -framework Foundation -framework CoreFoundation -framework CoreGraphics -framework QuartzCore \
-	-framework CoreLocation \
-	-o "$APP/Map" "$HERE"/*.m
+	-framework CoreLocation -framework CoreText -framework OpenGLES -weak_framework Metal -lz \
+	-o "$APP/Map" "$HERE"/*.m "$HERE"/mvt.c "$HERE"/earcut.c "$HERE"/style.c "$HERE"/tessellate.c
 if command -v "$LDID" >/dev/null 2>&1; then
 	"$LDID" -S "$APP/Map"
 	echo "build.sh: signed (ad hoc) by $LDID"
 fi
 sed 's/\r$//' "$HERE/Info.plist" > "$APP/Info.plist"
+# (the settings iOS's Settings shows for the app, and the app's own strings, in English and Chinese)
+cp -R "$HERE/Settings.bundle" "$APP/"
+for lang in en zh-Hans; do
+	mkdir -p "$APP/$lang.lproj"
+	cp "$HERE/strings/$lang.strings" "$APP/$lang.lproj/Localizable.strings"
+done
 python3 -I "$HERE/mkicon.py" "$APP"
 printf 'APPL????' > "$APP/PkgInfo"
 (cd "$OUT" && python3 -c "import shutil; shutil.make_archive('Map', 'zip', '.', 'Payload')" && mv Map.zip Map.ipa)

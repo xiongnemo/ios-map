@@ -1,0 +1,25 @@
+/* the map's own words; the English ones are the keys */
+"Copy" = "Copy";
+"Copied" = "Copied";
+"Dropped pin" = "Dropped pin";
+"Search places" = "Search places";
+"Searching…" = "Searching…";
+"No places found" = "No places found";
+"Map Settings" = "Map Settings";
+"Renderer" = "Renderer";
+"Style" = "Style";
+"Follow System" = "Follow System";
+"System" = "System";
+"Light" = "Light";
+"Dark" = "Dark";
+"Place Names" = "Place Names";
+"Local" = "Local";
+"Chinese" = "Chinese";
+"English" = "English";
+"Show Frame Rate" = "Show Frame Rate";
+"Done" = "Done";
+"Drawing with %@." = "Drawing with %@.";
+"Metal: %@." = "Metal: %@.";
+"Metal is not available to this app on this device" = "Metal is not available to this app on this device";
+"North up" = "North up";
+"Settings" = "Settings";

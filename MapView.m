@@ -1,43 +1,22 @@
-// MapView.m: the tiles (MapTiles downloads, decodes and keeps them), the layers they are shown in, the gestures, the
-// location's dot and cone, and the pin. See MapView.h.
+// MapView.m: the camera, which tiles a frame draws and where (MapSource has them, the renderer draws them), the labels
+// (MapLabels), the gestures, the location's dot and cone, and the pin. See MapView.h.
 #import <QuartzCore/QuartzCore.h>
+
+#import "MapLabels.h"
+#import "MapRenderer.h"
 #import "MapView.h"
 
-#define TILE_POINTS     256.0           /* a tile's size at its own zoom: its 256 pixels as 256 points, as OSM's maps do */
+#define TILE_POINTS     256.0           /* a tile's size at its own zoom, as OpenStreetMap counts zooms */
 #define EARTH_RADIUS    6378137.0       /* metres: Web Mercator's sphere, the size of WGS 84's equator */
 #define MAX_LATITUDE    85.0511287798   /* where Web Mercator's square world ends, north and south */
-#define DOWNLOADS       6               /* tiles downloading at once, as a browser would */
-#define DECODED_BYTES   (150 << 20)     /* decoded tiles kept in memory, counted by their bitmaps */
-#define DISK_BYTES      (50 << 20)      /* the PNGs on disk: little, as the data disk of the K40 port is RAM */
-#define MEMORY_BYTES    (4 << 20)       /* the PNGs in the URL cache's memory (the decoded ones are what counts) */
-#define FALLBACK_LEVELS 5               /* how many levels up a missing tile looks for one to enlarge */
-#define RETRY_AFTER     15.0            /* seconds before a tile that failed is asked for again (doubling each time) */
-
-static NSString *const default_tile_url = @"https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-
-NSString *
-user_agent(void)
-{
-	static NSString *agent;
-	static dispatch_once_t once;
-
-	dispatch_once(&once, ^{
-		NSString *version = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"1.0";
-
-		agent = [NSString stringWithFormat:@"Map/%@ (iOS; https://github.com/xiongnemo/ios-map)", version];
-	});
-	return agent;
-}
-
-NSString *
-coordinate_text(CLLocationCoordinate2D where)
-{
-	return [NSString stringWithFormat:@"%.5f, %.5f", where.latitude, where.longitude];
-}
+#define FALLBACK_LEVELS 6               /* how many levels up a missing tile looks for one to stand in for it */
+#define UPLOADS         4               /* tiles given to the GPU in one frame, at most (each a few hundred KB) */
+#define MAX_SLOTS       160             /* tiles of the screen, at most (a frame has at most four pieces for each) */
+#define EDGE            0.02f           /* tile units a piece's clip reaches past its edges: no hairline between them */
 
 /*
  * Web Mercator as a square of side 1: x from 0 at 180° west to 1 at 180° east, y from 0 at the top (85.05° north) to 1
- * at the bottom. A zoom level z cuts it into 2^z by 2^z tiles.
+ * at the bottom. A level z cuts it into 2^z by 2^z tiles.
  */
 static double
 world_x(double longitude)
@@ -65,284 +44,32 @@ latitude_at(double y)
 	return atan(sinh(M_PI * (1 - 2 * y))) * 180 / M_PI;
 }
 
-/*
- * A tile, or the place on the screen one is shown in, as one number: its level, x and y. x is offset by 2^30 so that
- * the places west of x = 0 and east of the last tile (the world repeats east and west) have numbers too.
- */
-static inline uint64_t
-tile_id(int z, long x, long y)
+NSString *
+coordinate_text(CLLocationCoordinate2D where)
 {
-	return (uint64_t)z << 56 | (uint64_t)(x + (1L << 30)) << 24 | (uint64_t)y;
+	return [NSString stringWithFormat:@"%.5f, %.5f", where.latitude, where.longitude];
 }
 
-static inline int
-tile_z(uint64_t tile)
+static long
+floor_div(long a, long b)
 {
-	return (int)(tile >> 56);
+	long q = a / b;
+
+	return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
 }
 
-static inline long
-tile_x(uint64_t tile)
+static void
+premultiplied(uint32_t rgba, float *out)
 {
-	return (long)(tile >> 24 & 0xffffffff) - (1L << 30);
+	float a = (rgba & 0xff) / 255.0f;
+
+	out[0] = ((rgba >> 24) & 0xff) / 255.0f * a;
+	out[1] = ((rgba >> 16) & 0xff) / 255.0f * a;
+	out[2] = ((rgba >> 8) & 0xff) / 255.0f * a;
+	out[3] = a;
 }
 
-static inline long
-tile_y(uint64_t tile)
-{
-	return (long)(tile & 0xffffff);
-}
-
-/*
- * A PNG as a bitmap ready to be shown: UIImage only reads the file and decodes it when it is first drawn, which would be
- * on the main thread, in the middle of a frame. Drawing it here, on a background queue, into a bitmap of the layout Core
- * Animation uses itself (32-bit BGRA, premultiplied) does the decoding now, and leaves Core Animation nothing to convert.
- */
-static id
-decoded(NSData *data)
-{
-	UIImage *png = [UIImage imageWithData:data];
-	CGImageRef source = png.CGImage, image;
-	CGColorSpaceRef space;
-	CGContextRef context;
-	size_t width, height;
-
-	if (source == NULL) {
-		return nil;
-	}
-	width = CGImageGetWidth(source);
-	height = CGImageGetHeight(source);
-	if (width == 0 || height == 0 || width > 1024 || height > 1024) {
-		return nil;
-	}
-	space = CGColorSpaceCreateDeviceRGB();
-	context = CGBitmapContextCreate(NULL, width, height, 8, 0, space,
-	    (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-	CGColorSpaceRelease(space);
-	if (context == NULL) {
-		return nil;
-	}
-	CGContextSetBlendMode(context, kCGBlendModeCopy);
-	CGContextDrawImage(context, CGRectMake(0, 0, width, height), source);
-	image = CGBitmapContextCreateImage(context);
-	CGContextRelease(context);
-	return image == NULL ? nil : (__bridge_transfer id)image;
-}
-
-@protocol MapTilesDelegate <NSObject>
-- (void)tileArrived:(uint64_t)tile;
-- (void)tileFailed:(uint64_t)tile;
-/* some tiles failed a while ago: whichever are still wanted may be asked for again */
-- (void)tilesMayBeRetried;
-@end
-
-/*
- * The tiles: the decoded ones in an NSCache (it lets go of them itself when memory runs short), the PNGs in a small
- * NSURLCache that honours the server's HTTP caching (OSM's usage policy asks for that), and at most DOWNLOADS
- * downloads at a time, of only the tiles the screen wants now, nearest its middle first. A tile that leaves the screen
- * is cancelled. Everything here is on the main thread except the download and the decoding.
- */
-@interface MapTiles : NSObject
-@property (weak, nonatomic) id<MapTilesDelegate> delegate;
-- (id)imageFor:(uint64_t)tile;
-- (BOOL)failed:(uint64_t)tile;
-- (void)want:(NSArray<NSNumber *> *)tiles;
-- (void)forget;
-@end
-
-@implementation MapTiles {
-	NSURLSession *_session;
-	NSString *_template;
-	NSCache *_images;
-	NSMutableDictionary<NSNumber *, NSURLSessionDataTask *> *_running;
-	NSMutableArray<NSNumber *> *_queue;
-	NSMutableDictionary<NSNumber *, NSNumber *> *_failedAt, *_failures;
-	BOOL _retrying;
-}
-
-- (instancetype)init
-{
-	NSURLSessionConfiguration *config = NSURLSessionConfiguration.defaultSessionConfiguration;
-	NSURL *caches = [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject;
-	NSString *custom = [NSUserDefaults.standardUserDefaults stringForKey:@"TileURL"];
-
-	self = [super init];
-	if (self == nil) {
-		return nil;
-	}
-	_template = custom.length > 0 ? custom : default_tile_url;
-	config.URLCache = [[NSURLCache alloc] initWithMemoryCapacity:MEMORY_BYTES diskCapacity:DISK_BYTES
-	    directoryURL:[caches URLByAppendingPathComponent:@"Tiles" isDirectory:YES]];
-	config.requestCachePolicy = NSURLRequestUseProtocolCachePolicy;
-	/* (iOS allows 4 connections to a host by default; over HTTP/2 there is one, and DOWNLOADS is kept here anyway) */
-	config.HTTPMaximumConnectionsPerHost = DOWNLOADS;
-	config.HTTPAdditionalHeaders = @{ @"User-Agent": user_agent() };
-	config.timeoutIntervalForRequest = 20;
-	_session = [NSURLSession sessionWithConfiguration:config];
-	_images = [NSCache new];
-	_images.totalCostLimit = DECODED_BYTES;
-	_running = [NSMutableDictionary new];
-	_queue = [NSMutableArray new];
-	_failedAt = [NSMutableDictionary new];
-	_failures = [NSMutableDictionary new];
-	return self;
-}
-
-- (id)imageFor:(uint64_t)tile
-{
-	return [_images objectForKey:@(tile)];
-}
-
-- (BOOL)failed:(uint64_t)tile
-{
-	NSNumber *key = @(tile), *when = _failedAt[key];
-	double wait;
-
-	if (when == nil) {
-		return NO;
-	}
-	/* (each failure in a row doubles the wait, up to five minutes: a server that refuses is not asked every second) */
-	wait = fmin(RETRY_AFTER * exp2(_failures[key].intValue - 1), 300);
-	return CFAbsoluteTimeGetCurrent() - when.doubleValue < wait;
-}
-
-- (NSURL *)urlFor:(uint64_t)tile
-{
-	NSString *url = _template;
-
-	url = [url stringByReplacingOccurrencesOfString:@"{z}" withString:[NSString stringWithFormat:@"%d", tile_z(tile)]];
-	url = [url stringByReplacingOccurrencesOfString:@"{x}" withString:[NSString stringWithFormat:@"%ld", tile_x(tile)]];
-	url = [url stringByReplacingOccurrencesOfString:@"{y}" withString:[NSString stringWithFormat:@"%ld", tile_y(tile)]];
-	return [NSURL URLWithString:url];
-}
-
-/* The wish list, nearest the screen's middle first; it replaces the one before, and what is no longer on it stops. */
-- (void)want:(NSArray<NSNumber *> *)tiles
-{
-	NSSet<NSNumber *> *wanted = [NSSet setWithArray:tiles];
-
-	for (NSNumber *key in _running.allKeys) {
-		if (![wanted containsObject:key]) {
-			[_running[key] cancel];
-			[_running removeObjectForKey:key];
-		}
-	}
-	[_queue removeAllObjects];
-	for (NSNumber *key in tiles) {
-		if (_running[key] == nil && [_images objectForKey:key] == nil && ![self failed:key.unsignedLongLongValue]) {
-			[_queue addObject:key];
-		}
-	}
-	[self pump];
-}
-
-- (void)pump
-{
-	while (_running.count < DOWNLOADS && _queue.count > 0) {
-		NSNumber *key = _queue.firstObject;
-
-		[_queue removeObjectAtIndex:0];
-		if (_running[key] == nil && [_images objectForKey:key] == nil) {
-			[self start:key.unsignedLongLongValue];
-		}
-	}
-}
-
-- (void)start:(uint64_t)tile
-{
-	NSURL *url = [self urlFor:tile];
-	NSMutableURLRequest *request;
-	NSURLSessionDataTask *task;
-	__block __weak NSURLSessionDataTask *weakTask = nil;
-	__weak MapTiles *weak = self;
-
-	if (url == nil) {
-		/* (a TileURL that is not a URL: every tile fails, grey, and nothing crashes) */
-		dispatch_async(dispatch_get_main_queue(), ^{
-			[weak finished:tile task:nil image:nil cancelled:NO];
-		});
-		return;
-	}
-	request = [NSMutableURLRequest requestWithURL:url];
-	[request setValue:user_agent() forHTTPHeaderField:@"User-Agent"];
-	task = [_session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response,
-	    NSError *error) {
-		NSURLSessionDataTask *done = weakTask;
-		BOOL http = [response isKindOfClass:NSHTTPURLResponse.class];
-		NSInteger status = http ? ((NSHTTPURLResponse *)response).statusCode : 0;
-
-		if (error != nil || data.length == 0 || (http && status != 200)) {
-			BOOL cancelled = [error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled;
-
-			dispatch_async(dispatch_get_main_queue(), ^{
-				[weak finished:tile task:done image:nil cancelled:cancelled];
-			});
-			return;
-		}
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-			id image = decoded(data);
-
-			dispatch_async(dispatch_get_main_queue(), ^{
-				[weak finished:tile task:done image:image cancelled:NO];
-			});
-		});
-	}];
-	weakTask = task;
-	_running[@(tile)] = task;
-	[task resume];
-}
-
-- (void)finished:(uint64_t)tile task:(NSURLSessionDataTask *)task image:(id)image cancelled:(BOOL)cancelled
-{
-	NSNumber *key = @(tile);
-
-	/* (only if it is still this download: a cancelled one may end after the same tile was asked for again) */
-	if (task == nil || _running[key] == task) {
-		[_running removeObjectForKey:key];
-	}
-	if (image != nil) {
-		CGImageRef bitmap = (__bridge CGImageRef)image;
-
-		[_images setObject:image forKey:key cost:CGImageGetBytesPerRow(bitmap) * CGImageGetHeight(bitmap)];
-		[_failedAt removeObjectForKey:key];
-		[_failures removeObjectForKey:key];
-		[_delegate tileArrived:tile];
-	} else if (!cancelled) {
-		_failedAt[key] = @(CFAbsoluteTimeGetCurrent());
-		_failures[key] = @(_failures[key].intValue + 1);
-		[_delegate tileFailed:tile];
-		[self retryLater];
-	}
-	[self pump];
-}
-
-- (void)retryLater
-{
-	__weak MapTiles *weak = self;
-
-	if (_retrying) {
-		return;
-	}
-	_retrying = YES;
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((RETRY_AFTER + 0.5) * NSEC_PER_SEC)),
-	    dispatch_get_main_queue(), ^{
-		MapTiles *me = weak;
-
-		if (me != nil) {
-			me->_retrying = NO;
-			[me->_delegate tilesMayBeRetried];
-		}
-	});
-}
-
-- (void)forget
-{
-	[_images removeAllObjects];
-}
-
-@end
-
-/* A layer that never animates by itself: a tile is where the finger put it now, not a quarter of a second later. */
+/* A layer that never animates by itself: the dot is where the map put it now, not a quarter of a second later. */
 @interface MapQuietLayer : CALayer
 @end
 
@@ -353,26 +80,6 @@ decoded(NSData *data)
 	return nil;
 }
 
-@end
-
-/*
- * A place on the screen for one tile of the level shown. Until that tile is here it shows the nearest tile above it
- * that is (enlarged: contentsRect picks the part of it that covers this one), and over that whichever of the four tiles
- * below it are (zooming out, they were on the screen a moment ago); with none of them, grey.
- */
-@interface MapTileSlot : NSObject {
-@public
-	MapQuietLayer *layer;
-	MapQuietLayer *children[4];
-	int z;
-	long x, y;              /* x as laid out, east or west of the world's first copy */
-	uint64_t tile;          /* the tile it shows: x brought into the world */
-	BOOL own;               /* that tile is on it */
-	CGRect frame;
-}
-@end
-
-@implementation MapTileSlot
 @end
 
 enum { MOTION_NONE, MOTION_FLING, MOTION_ANIMATION };
@@ -448,36 +155,71 @@ pin_image(void)
 	return image;
 }
 
-@interface MapView () <UIGestureRecognizerDelegate, MapTilesDelegate>
+/* a tile of the screen: its level, x (as laid out: east or west of the world's first copy) and y */
+struct slot {
+	int z;
+	long x, y;
+	double distance;                /* of its middle from the screen's, in points */
+};
+
+static int
+by_distance(const void *a, const void *b)
+{
+	const struct slot *p = a, *q = b;
+
+	return p->distance < q->distance ? -1 : p->distance > q->distance ? 1 : 0;
+}
+
+@interface MapView () <UIGestureRecognizerDelegate, MapSourceDelegate>
 @end
 
 @implementation MapView {
-	MapTiles *_tiles;
-	CALayer *_tileHost, *_userHost;
+	MapSource *_source;
+	id<MapRenderer> _renderer;
+	NSUInteger _generation;         /* counts the renderers made: a tile's GPU copy is of the one it says */
+	MapLabels *_labels;
+	CALayer *_userHost;
 	MapQuietLayer *_accuracy, *_cone, *_dot;
-	NSMutableDictionary<NSNumber *, MapTileSlot *> *_slots;
-	NSMutableArray<MapQuietLayer *> *_spare;
-	UIColor *_loadingColor, *_failedColor;
-	CGFloat _pixel;             /* the screen's pixels per point */
+	UILabel *_rate;
+	CGFloat _pixel;                 /* the screen's pixels per point */
 
-	double _cx, _cy;            /* the centre, in world units (x wraps round) */
-	double _z;                  /* the zoom: fractional, MAP_MIN_ZOOM to MAP_MAX_ZOOM */
-	int _level;                 /* the zoom level whose tiles are shown */
-	BOOL _zooming;              /* a pinch or a zoom animation: the level's tiles are scaled, and none is fetched */
-	BOOL _wantAgain;            /* the tiles wanted are to be sent again, even if the screen shows the same ones */
-	double _ux, _uy;            /* the user's location, in world units */
+	double _cx, _cy;                /* the centre, in world units (x wraps round) */
+	double _z;                      /* the zoom: fractional, MAP_MIN_ZOOM to MAP_MAX_ZOOM */
+	double _turn;                   /* the bearing, radians */
+	int _level;                     /* the level whose tiles are shown */
+	BOOL _zooming;                  /* a pinch or a zoom animation: the level stays, and nothing is fetched */
+	BOOL _wantAgain;                /* the tiles wanted are to be sent again, even if the screen wants the same ones */
+	NSArray<NSNumber *> *_wanted;
+	double _ux, _uy;                /* the user's location, in world units */
+	BOOL _lastDark;
+
+	struct slot _slots[MAX_SLOTS];
+	unsigned _slotCount;
+	struct map_piece _pieces[4 * MAX_SLOTS];
+	unsigned _pieceCount;
+	NSMutableArray *_drawn;         /* the tiles of the frame's pieces, held while it is drawn */
+	unsigned _uploads;
+
+	CADisplayLink *_link;
+	BOOL _dirty;
+	unsigned _idle;
+	double _shownX, _shownY, _shownZ, _shownTurn;   /* what the overlays and the delegate were last told */
+	unsigned _frames;
+	CFTimeInterval _rateSince, _frameTime, _worstFrame, _lastFrame;
+	CFTimeInterval _spentTiles, _spentLabels, _spentDraw;   /* the frames' time, part by part (the self-test's) */
 
 	UIPanGestureRecognizer *_panner;
 	UIPinchGestureRecognizer *_pincher;
-	BOOL _pinching, _dragTold, _pinchAtKnown;
+	UIRotationGestureRecognizer *_rotator;
+	BOOL _pinching, _dragTold, _pinchAtKnown, _turning;
 	CGPoint _pinchAt;
+	double _rotationHeld;           /* a turn of the fingers too small yet to turn the map (a pinch turns a little) */
 	CFTimeInterval _pinchEnded;
 
-	CADisplayLink *_link;
 	int _motion;
 	CGPoint _velocity;
 	CFTimeInterval _last, _start, _duration;
-	double _fromX, _fromY, _fromZ, _toX, _toY, _toZ;
+	double _fromX, _fromY, _fromZ, _fromTurn, _toX, _toY, _toZ, _toTurn;
 	BOOL _anchored;
 	double _anchorX, _anchorY;
 	CGPoint _anchorAt;
@@ -488,6 +230,8 @@ pin_image(void)
 	UIImageView *_pin;
 	UIView *_callout;
 	UIButton *_copy;
+
+	void (^_test)(void);            /* the self-test's step, run after each frame */
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -499,19 +243,15 @@ pin_image(void)
 	if (self == nil) {
 		return nil;
 	}
-	_loadingColor = [UIColor colorWithRed:0.93 green:0.92 blue:0.90 alpha:1];
-	_failedColor = [UIColor colorWithWhite:0.78 alpha:1];
-	_pixel = UIScreen.mainScreen.scale;
-	self.backgroundColor = _loadingColor;
+	_pixel = UIScreen.mainScreen.nativeScale;
 	self.clipsToBounds = YES;
 	self.multipleTouchEnabled = YES;
-	_tiles = [MapTiles new];
-	_tiles.delegate = self;
-	_slots = [NSMutableDictionary new];
-	_spare = [NSMutableArray new];
-	_tileHost = [MapQuietLayer layer];
+	self.backgroundColor = UIColor.clearColor;
+	_source = [MapSource new];
+	_source.delegate = self;
+	_labels = [MapLabels new];
+	_drawn = [NSMutableArray array];
 	_userHost = [MapQuietLayer layer];
-	[self.layer addSublayer:_tileHost];
 	[self.layer addSublayer:_userHost];
 	[self makeUserLayers];
 	_cx = 0.5;
@@ -519,19 +259,27 @@ pin_image(void)
 	_z = MAP_MIN_ZOOM;
 	_level = -1;
 	_heading = -1;
+	_shownZ = -1;
+	_samples = 4;
 
 	_panner = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)];
 	_pincher = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(pinch:)];
+	_rotator = [[UIRotationGestureRecognizer alloc] initWithTarget:self action:@selector(rotate:)];
 	doubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(doubleTap:)];
 	doubleTap.numberOfTapsRequired = 2;
 	twoFingerTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(twoFingerTap:)];
 	twoFingerTap.numberOfTouchesRequired = 2;
 	press = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(press:)];
-	for (UIGestureRecognizer *recognizer in @[ _panner, _pincher, doubleTap, twoFingerTap, press ]) {
+	for (UIGestureRecognizer *recognizer in @[ _panner, _pincher, _rotator, doubleTap, twoFingerTap, press ]) {
 		recognizer.delegate = self;
 		[self addGestureRecognizer:recognizer];
 	}
 	return self;
+}
+
+- (void)dealloc
+{
+	[_link invalidate];
 }
 
 - (void)makeUserLayers
@@ -561,12 +309,167 @@ pin_image(void)
 - (void)layoutSubviews
 {
 	[super layoutSubviews];
-	_tileHost.frame = self.bounds;
-	_userHost.frame = self.bounds;
 	if (self.window != nil) {
-		_pixel = self.window.screen.scale;
+		_pixel = self.window.screen.nativeScale;
 	}
-	[self update];
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	_renderer.layer.frame = self.bounds;
+	_renderer.layer.contentsScale = _pixel;
+	_userHost.frame = self.bounds;
+	[CATransaction commit];
+	if (_rate != nil) {
+		_rate.frame = CGRectMake(self.safeAreaInsets.left + 8, self.safeAreaInsets.top + 70, 210, 34);
+	}
+	[self setNeedsFrame];
+}
+
+- (void)didMoveToWindow
+{
+	[super didMoveToWindow];
+	if (self.window != nil) {
+		[self setNeedsFrame];
+	} else {
+		[_link invalidate];
+		_link = nil;
+	}
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previous
+{
+	[super traitCollectionDidChange:previous];
+	[self setNeedsFrame];
+}
+
+#pragma mark the renderer and the look
+
+- (void)setRendererKind:(MapRendererKind)kind
+{
+	if (kind == _rendererKind && _renderer != nil) {
+		return;
+	}
+	_rendererKind = kind;
+	if (_renderer != nil) {
+		[self makeRenderer];
+	}
+}
+
+- (void)setSamples:(unsigned)samples
+{
+	samples = samples > 1 ? 4 : 1;
+	if (samples != _samples) {
+		_samples = samples;
+		if (_renderer != nil) {
+			[self makeRenderer];
+		}
+	}
+}
+
+- (NSString *)rendererName
+{
+	return _renderer.name;
+}
+
+/* the renderer the settings say; the tiles' GPU copies of the one before are let go of, the new one makes its own */
+- (void)makeRenderer
+{
+	NSString *why = nil;
+	id<MapRenderer> made = nil, old = _renderer;
+	NSUInteger generation;
+
+	[_renderer.layer removeFromSuperlayer];
+	_renderer = nil;
+	/* (the old one let go of a turn of the main queue later, not now: the K40 port's OpenGL ES before hk 49d3826 read
+	   a context in a block its last present had queued on the main queue, and faulted if the context was gone) */
+	if (old != nil) {
+		dispatch_async(dispatch_get_main_queue(), ^{
+			(void)old;
+		});
+	}
+	generation = ++_generation;
+	[_source forEachTile:^(MapTile *tile) {
+		tile.gpu = nil;
+		tile.gpuOf = 0;
+	}];
+	if (_rendererKind == MapRendererKindMetal) {
+		made = map_renderer_metal(_samples, &why);
+		if (made == nil) {
+			NSLog(@"mapcheck: no Metal renderer: %@; OpenGL ES instead", why);
+		}
+	}
+	if (made == nil) {
+		made = map_renderer_gl(_samples, &why);
+		if (made == nil) {
+			NSLog(@"mapcheck: no OpenGL ES renderer: %@", why);
+			return;
+		}
+	}
+	_renderer = made;
+	(void)generation;
+	[CATransaction begin];
+	[CATransaction setDisableActions:YES];
+	made.layer.frame = self.bounds;
+	made.layer.contentsScale = _pixel;
+	[self.layer insertSublayer:made.layer atIndex:0];
+	[CATransaction commit];
+	[_labels forgetAtlas];
+	NSLog(@"mapcheck: renderer %@", made.name);
+	[self setNeedsFrame];
+}
+
+- (BOOL)dark
+{
+	if (_style == MapStyleSystem) {
+		return self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
+	}
+	return _style == MapStyleDark;
+}
+
+- (void)setStyle:(MapStyleChoice)style
+{
+	_style = style;
+	[self setNeedsFrame];
+}
+
+- (void)setLabelLanguage:(enum style_language)language
+{
+	if (language != _labels.language) {
+		_labels.language = language;
+		[_labels forgetAtlas];
+	}
+	_source.language = language;
+	_wantAgain = YES;
+	[self setNeedsFrame];
+}
+
+- (enum style_language)labelLanguage
+{
+	return _source.language;
+}
+
+- (void)setCoveredRects:(NSArray<NSValue *> *)rects
+{
+	if (![rects isEqualToArray:_coveredRects]) {
+		_coveredRects = [rects copy];
+		[self setNeedsFrame];
+	}
+}
+
+- (void)setShowsFrameRate:(BOOL)shows
+{
+	_showsFrameRate = shows;
+	if (shows && _rate == nil) {
+		_rate = [UILabel new];
+		_rate.font = [UIFont monospacedDigitSystemFontOfSize:11 weight:UIFontWeightMedium];
+		_rate.numberOfLines = 2;
+		_rate.layer.cornerRadius = 5;
+		_rate.layer.masksToBounds = YES;
+		_rate.userInteractionEnabled = NO;
+		[self addSubview:_rate];
+		[self setNeedsLayout];
+	}
+	_rate.hidden = !shows;
+	_rateSince = 0;
 }
 
 #pragma mark where things are
@@ -574,6 +477,13 @@ pin_image(void)
 - (double)zoom
 {
 	return _z;
+}
+
+- (double)bearing
+{
+	double degrees = fmod(_turn * 180 / M_PI, 360);
+
+	return degrees < 0 ? degrees + 360 : degrees;
 }
 
 - (CLLocationCoordinate2D)centerCoordinate
@@ -596,281 +506,429 @@ pin_image(void)
 - (CGPoint)pointAtX:(double)x y:(double)y
 {
 	CGSize size = self.bounds.size;
-	double ppw = [self ppw], dx = x - _cx;
+	double ppw = [self ppw], dx = x - _cx, sx, sy, c = cos(_turn), s = sin(_turn);
 
 	dx -= round(dx);
-	return CGPointMake(size.width / 2 + dx * ppw, size.height / 2 + (y - _cy) * ppw);
+	sx = dx * ppw;
+	sy = (y - _cy) * ppw;
+	/* (the world turned by minus the bearing: what is east is up when the top of the screen points east) */
+	return CGPointMake(size.width / 2 + c * sx + s * sy, size.height / 2 - s * sx + c * sy);
 }
 
 - (void)worldAt:(CGPoint)p x:(double *)x y:(double *)y
 {
 	CGSize size = self.bounds.size;
-	double ppw = [self ppw];
+	double ppw = [self ppw], dx = p.x - size.width / 2, dy = p.y - size.height / 2, c = cos(_turn), s = sin(_turn);
 
-	*x = _cx + (p.x - size.width / 2) / ppw;
-	*y = _cy + (p.y - size.height / 2) / ppw;
-}
-
-- (CGFloat)snap:(double)value
-{
-	return round(value * _pixel) / _pixel;
+	*x = _cx + (c * dx - s * dy) / ppw;
+	*y = _cy + (s * dx + c * dy) / ppw;
 }
 
 - (void)clamp
 {
+	CGSize size = self.bounds.size;
 	double half;
 
 	_z = isfinite(_z) ? fmin(MAP_MAX_ZOOM, fmax(MAP_MIN_ZOOM, _z)) : MAP_MIN_ZOOM;
 	_cx = isfinite(_cx) ? _cx - floor(_cx) : 0.5;
 	_cy = isfinite(_cy) ? _cy : 0.5;
+	_turn = isfinite(_turn) ? remainder(_turn, 2 * M_PI) : 0;
 	/* (north and south the world ends: the centre stays where the screen is full of it, or in the middle when the
-	   world is less tall than the screen) */
-	half = self.bounds.size.height / 2 / [self ppw];
+	   world is less tall than the screen -- turned, the screen's height is partly its width) */
+	half = (fabs(cos(_turn)) * size.height + fabs(sin(_turn)) * size.width) / 2 / [self ppw];
 	_cy = half >= 0.5 ? 0.5 : fmin(1 - half, fmax(half, _cy));
+}
+
+#pragma mark frames
+
+- (void)setNeedsFrame
+{
+	_dirty = YES;
+	[self startLink];
+}
+
+- (void)startLink
+{
+	float most = (float)UIScreen.mainScreen.maximumFramesPerSecond;
+
+	if (_link != nil || self.window == nil) {
+		return;
+	}
+	/* (as fast as the screen goes, 120 Hz where it can; it runs only while something changes, and stops when
+	   nothing does: a map that stands still is not drawn again) */
+	_link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+	if (@available(iOS 15.0, *)) {
+		_link.preferredFrameRateRange = CAFrameRateRangeMake(fminf(60, most), most, most);
+	}
+	[_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+	_idle = 0;
+}
+
+- (void)tick:(CADisplayLink *)link
+{
+	BOOL moving = [self advance:CACurrentMediaTime()];
+
+	if (_dirty || moving) {
+		_dirty = NO;
+		_idle = 0;
+		[self drawFrame];
+	} else if (++_idle > 3) {
+		/* (the link holds the view: let go of it, made again when something changes) */
+		[_link invalidate];
+		_link = nil;
+	}
+	if (_test != nil) {
+		void (^step)(void) = _test;
+
+		step();
+	}
+}
+
+/* the tile of the screen's slot, made and on the GPU; nil if it is not (yet) */
+- (MapTile *)ready:(uint64_t)key
+{
+	MapTile *tile = [_source tileFor:key];
+
+	if (tile == nil) {
+		return nil;
+	}
+	if (tile.gpu == nil || tile.gpuOf != _generation) {
+		if (_uploads == 0) {
+			_dirty = YES;
+			return nil;
+		}
+		_uploads--;
+		tile.gpu = [_renderer makeTile:tile.mesh];
+		tile.gpuOf = _generation;
+		if (tile.gpu == nil) {
+			return nil;
+		}
+	}
+	return tile;
+}
+
+/* the piece of tile `tile` (of level z, at x, y as laid out) shown in `clip` of its units */
+- (void)addPiece:(MapTile *)tile z:(int)z x:(long)x y:(long)y clip:(const float *)clip
+{
+	CGSize size = self.bounds.size;
+	double ppw = [self ppw], n = exp2(z), k = ppw / (n * 4096), c = cos(_turn), s = sin(_turn);
+	double ox = (x / n - _cx) * ppw, oy = (y / n - _cy) * ppw;
+	struct map_piece *piece;
+	CGAffineTransform t;
+
+	if (_pieceCount == sizeof(_pieces) / sizeof(_pieces[0])) {
+		return;
+	}
+	/* tile units to screen points: the tile's corner at its place, the world turned by minus the bearing */
+	t.a = c * k;
+	t.b = -s * k;
+	t.c = s * k;
+	t.d = c * k;
+	t.tx = size.width / 2 + c * ox + s * oy;
+	t.ty = size.height / 2 - s * ox + c * oy;
+	piece = &_pieces[_pieceCount++];
+	piece->tile = tile.gpu;
+	piece->matrix[0] = (float)(t.a * 2 / size.width);
+	piece->matrix[1] = (float)(-t.b * 2 / size.height);
+	piece->matrix[2] = (float)(t.c * 2 / size.width);
+	piece->matrix[3] = (float)(-t.d * 2 / size.height);
+	piece->matrix[4] = (float)((t.tx - size.width / 2) * 2 / size.width);
+	piece->matrix[5] = (float)(-(t.ty - size.height / 2) * 2 / size.height);
+	memcpy(piece->clip, clip, sizeof(piece->clip));
+	[_drawn addObject:tile];
+	[_labels addTile:tile transform:t clip:clip];
+}
+
+/* the part of an ancestor's units (d levels up, at ax, ay) that is (x0, y0, x1, y1) of the slot's (at x, y) */
+static void
+clip_in_ancestor(long x, long y, long ax, long ay, int d, const float *slot, float *clip)
+{
+	double part = 1.0 / (1L << d), fx = (double)(x - (ax << d)), fy = (double)(y - (ay << d));
+
+	clip[0] = (float)((fx * 4096 + slot[0]) * part) - EDGE;
+	clip[1] = (float)((fy * 4096 + slot[1]) * part) - EDGE;
+	clip[2] = (float)((fx * 4096 + slot[2]) * part) + EDGE;
+	clip[3] = (float)((fy * 4096 + slot[3]) * part) + EDGE;
+}
+
+/* the level to show at a style zoom (MapLibre's: a tile is 512 points across at its own) */
+- (int)levelFor:(double)styleZoom
+{
+	int level = (int)floor(styleZoom + 1e-9);
+
+	level = MAX(0, MIN(MAP_DATA_ZOOM, level));
+	/* (while zooming the level stays, its tiles scaled, unless the zoom goes far from it: half too small is four
+	   times the tiles, four times too big is short of detail) */
+	if (_zooming && _level >= 0 && styleZoom >= _level - 1 && styleZoom < _level + 2) {
+		level = _level;
+	}
+	return level;
+}
+
+/* the screen's tiles at `level`: those whose square the turned screen overlaps, nearest its middle first */
+- (void)findSlots:(int)level
+{
+	CGSize size = self.bounds.size;
+	const CGPoint corners[4] = { { 0, 0 }, { size.width, 0 }, { 0, size.height }, { size.width, size.height } };
+	double minx = INFINITY, maxx = -INFINITY, miny = INFINITY, maxy = -INFINITY, n = exp2(level);
+	long x0, x1, y0, y1;
+
+	for (int i = 0; i < 4; i++) {
+		double x, y;
+
+		[self worldAt:corners[i] x:&x y:&y];
+		minx = fmin(minx, x);
+		maxx = fmax(maxx, x);
+		miny = fmin(miny, y);
+		maxy = fmax(maxy, y);
+	}
+	x0 = (long)floor(minx * n);
+	x1 = (long)floor(maxx * n);
+	y0 = MAX(0, (long)floor(miny * n));
+	y1 = MIN((long)n - 1, (long)floor(maxy * n));
+	_slotCount = 0;
+	for (long y = y0; y <= y1; y++) {
+		for (long x = x0; x <= x1 && _slotCount < MAX_SLOTS; x++) {
+			CGPoint p[4] = {
+				[self pointAtX:x / n y:y / n], [self pointAtX:(x + 1) / n y:y / n],
+				[self pointAtX:x / n y:(y + 1) / n], [self pointAtX:(x + 1) / n y:(y + 1) / n],
+			};
+			double left = INFINITY, right = -INFINITY, top = INFINITY, bottom = -INFINITY, sx = 0, sy = 0;
+
+			/* (pointAtX takes each corner to the copy of the world nearest the middle, which for a tile on the
+			   screen is the copy it is laid out in) */
+			for (int i = 0; i < 4; i++) {
+				left = fmin(left, p[i].x);
+				right = fmax(right, p[i].x);
+				top = fmin(top, p[i].y);
+				bottom = fmax(bottom, p[i].y);
+				sx += p[i].x / 4;
+				sy += p[i].y / 4;
+			}
+			/* (the tile's square against the screen's sides; the screen against the tile's came with the range) */
+			if (right < 0 || bottom < 0 || left > size.width || top > size.height) {
+				continue;
+			}
+			_slots[_slotCount++] = (struct slot){ level, x, y,
+			    hypot(sx - size.width / 2, sy - size.height / 2) };
+		}
+	}
+	qsort(_slots, _slotCount, sizeof(struct slot), by_distance);
+}
+
+- (void)drawFrame
+{
+	CGSize size = self.bounds.size;
+	CFTimeInterval began = CACurrentMediaTime();
+	const float full[4] = { -EDGE, -EDGE, 4096 + EDGE, 4096 + EDGE };
+	double styleZoom, c, s;
+	BOOL dark;
+	int level;
+	long n;
+	NSMutableArray<NSNumber *> *wanted;
+	struct map_frame frame;
+	unsigned labelVertices = 0;
+
+	if (size.width < 1 || size.height < 1 || self.window == nil) {
+		return;
+	}
+	if (_renderer == nil) {
+		[self makeRenderer];
+		if (_renderer == nil) {
+			return;
+		}
+	}
+	[self clamp];
+	styleZoom = _z - 1;
+	dark = self.dark;
+	level = [self levelFor:styleZoom];
+	if (level != _level) {
+		_level = level;
+	}
+	n = 1L << level;
+	[self findSlots:level];
+	[_drawn removeAllObjects];
+	[_labels beginFrame:size scale:_pixel zoom:styleZoom bearing:_turn dark:dark covered:_coveredRects];
+	_pieceCount = 0;
+	_uploads = UPLOADS;
+	wanted = [NSMutableArray arrayWithCapacity:_slotCount];
+	for (unsigned i = 0; i < _slotCount; i++) {
+		const struct slot *slot = &_slots[i];
+		long wx = (slot->x % n + n) % n;
+		uint64_t key = tile_id(level, wx, slot->y);
+		MapTile *own = [self ready:key], *child[4] = { nil, nil, nil, nil }, *up = nil;
+		BOOL anyChild = NO;
+		long ax = 0, ay = 0;
+		int d = 0;
+
+		if (own != nil) {
+			[self addPiece:own z:level x:slot->x y:slot->y clip:full];
+			continue;
+		}
+		if ([_source tileFor:key] == nil) {
+			[wanted addObject:@(key)];
+		}
+		/* until it is here: the four of the level below that are (zooming out, they were a moment ago), and for
+		   the rest of it the nearest tile above that is */
+		if (level < MAP_DATA_ZOOM) {
+			for (int q = 0; q < 4; q++) {
+				child[q] = [self ready:tile_id(level + 1, 2 * wx + (q & 1), 2 * slot->y + (q >> 1))];
+				anyChild |= child[q] != nil;
+			}
+		}
+		for (d = 1; d <= FALLBACK_LEVELS && level - d >= 0; d++) {
+			long an = n >> d;
+
+			ax = floor_div(slot->x, 1L << d);
+			ay = slot->y >> d;
+			up = [self ready:tile_id(level - d, (ax % an + an) % an, ay)];
+			if (up != nil) {
+				break;
+			}
+		}
+		if (!anyChild) {
+			if (up != nil) {
+				const float whole[4] = { 0, 0, 4096, 4096 };
+				float clip[4];
+
+				clip_in_ancestor(slot->x, slot->y, ax, ay, d, whole, clip);
+				[self addPiece:up z:level - d x:ax y:ay clip:clip];
+			}
+			continue;
+		}
+		for (int q = 0; q < 4; q++) {
+			if (child[q] != nil) {
+				[self addPiece:child[q] z:level + 1 x:2 * slot->x + (q & 1) y:2 * slot->y + (q >> 1) clip:full];
+			} else if (up != nil) {
+				const float quarter[4] = { (q & 1) * 2048.0f, (q >> 1) * 2048.0f, (q & 1) * 2048.0f + 2048,
+				    (q >> 1) * 2048.0f + 2048 };
+				float clip[4];
+
+				clip_in_ancestor(slot->x, slot->y, ax, ay, d, quarter, clip);
+				[self addPiece:up z:level - d x:ax y:ay clip:clip];
+			}
+		}
+	}
+	if (!_zooming && (_wantAgain || ![wanted isEqualToArray:_wanted ?: @[]])) {
+		_wantAgain = NO;
+		_wanted = wanted;
+		[_source want:wanted];
+	}
+
+	/* the passes: what of the style is drawn at this zoom, in which colour and how wide */
+	memset(&frame, 0, sizeof(frame));
+	premultiplied(style_background(dark), frame.background);
+	for (unsigned p = 1; p < MAP_PASSES; p++) {
+		frame.passes[p].lines = 1;
+	}
+	for (unsigned i = 0; i < style_draw_count; i++) {
+		const struct style_draw *draw = &style_draws[i];
+		BOOL line = style_kind_of(draw->bucket) == STYLE_LINE;
+		/* (fills; then the lines under the roads -- water, runways -- ; the roads' casings; the roads and the rest) */
+		struct map_pass *pass = &frame.passes[!line ? 0 : draw->casing ? 2 : draw->bucket < B_PATH ? 1 : 3];
+
+		if (styleZoom >= draw->min_zoom) {
+			premultiplied(draw->colour[dark], pass->colour[draw->bucket]);
+		}
+		pass->half[draw->bucket] = line ? style_line_width(draw->bucket, styleZoom, draw->casing) / 2 : 0;
+	}
+	c = cos(_turn);
+	s = sin(_turn);
+	frame.extrude[0] = (float)(2 * c / size.width);
+	frame.extrude[1] = (float)(2 * s / size.height);
+	frame.extrude[2] = (float)(2 * s / size.width);
+	frame.extrude[3] = (float)(-2 * c / size.height);
+	frame.pixel = (float)(1 / _pixel);
+	frame.pieces = _pieces;
+	frame.piece_count = _pieceCount;
+	{
+		CFTimeInterval t1 = CACurrentMediaTime(), t2;
+
+		frame.labels = [_labels finishFor:_renderer count:&labelVertices];
+		frame.label_vertices = labelVertices;
+		if (_labels.pending) {
+			_dirty = YES;
+		}
+		t2 = CACurrentMediaTime();
+		[_renderer drawFrame:&frame];
+		/* (the tiles' part has the labels' gathering in it: addPiece hands each tile's labels over) */
+		_spentTiles += t1 - began;
+		_spentLabels += t2 - t1;
+		_spentDraw += CACurrentMediaTime() - t2;
+	}
+	[_drawn removeAllObjects];
+
+	if (dark != _lastDark) {
+		_lastDark = dark;
+		if ([_delegate respondsToSelector:@selector(mapViewDidChangeLook:)]) {
+			[_delegate mapViewDidChangeLook:self];
+		}
+	}
+	if (_cx != _shownX || _cy != _shownY || _z != _shownZ || _turn != _shownTurn) {
+		_shownX = _cx;
+		_shownY = _cy;
+		_shownZ = _z;
+		_shownTurn = _turn;
+		[self placeUser];
+		[self placePin];
+		[_delegate mapViewDidChange:self];
+	}
+	[self countFrame:CACurrentMediaTime() - began];
+}
+
+/* frames a second over the last second, and the time a frame takes the processor (the GPU's runs after) */
+- (void)countFrame:(CFTimeInterval)took
+{
+	CFTimeInterval now = CACurrentMediaTime();
+
+	_lastFrame = took;
+	_frames++;
+	_frameTime += took;
+	_worstFrame = fmax(_worstFrame, took);
+	if (_rateSince == 0) {
+		_rateSince = now;
+		_frames = 0;
+		_frameTime = 0;
+		_worstFrame = 0;
+	} else if (now - _rateSince >= 1) {
+		if (_showsFrameRate) {
+			BOOL dark = self.dark;
+
+			_rate.text = [NSString stringWithFormat:@" %.0f fps  %@\n %.1f ms a frame (most %.1f), %u tiles", _frames /
+			    (now - _rateSince), _renderer.name ?: @"-", _frames ? 1000 * _frameTime / _frames : 0, 1000 * _worstFrame,
+			    _pieceCount];
+			_rate.textColor = dark ? UIColor.whiteColor : UIColor.blackColor;
+			_rate.backgroundColor = [UIColor colorWithWhite:dark ? 0 : 1 alpha:0.6];
+		}
+		_rateSince = now;
+		_frames = 0;
+		_frameTime = 0;
+		_worstFrame = 0;
+	}
 }
 
 #pragma mark the tiles
 
-/*
- * Everything on the screen, for the centre and zoom as they are now: the slots of the visible tiles at their places,
- * the wish list to MapTiles when the set of them changed, the dot and the pin. Called on every frame of a gesture.
- */
-- (void)update
+- (void)sourceTileArrived:(uint64_t)key
 {
-	CGSize size = self.bounds.size;
-	NSMutableDictionary<NSNumber *, MapTileSlot *> *slots;
-	BOOL changed;
-	int level;
-	long n, x0, x1, y0, y1;
-	double ts, tx0, ty0;
-
-	if (size.width < 1 || size.height < 1) {
-		return;
-	}
-	[self clamp];
-	/*
-	 * The level nearest the zoom. While zooming the level stays (its tiles are scaled, and nothing new is fetched until
-	 * the fingers let go) unless the zoom moves more than one level away from it: twice too big is blurry enough, and
-	 * half too small already means four times as many tiles.
-	 */
-	level = (int)lround(_z);
-	if (_zooming && _level >= MAP_MIN_ZOOM && fabs(_z - _level) <= 1) {
-		level = _level;
-	}
-	level = MAX(MAP_MIN_ZOOM, MIN(MAP_MAX_ZOOM, level));
-	changed = level != _level;
-	_level = level;
-	n = 1L << level;
-	ts = TILE_POINTS * exp2(_z - level);
-	tx0 = _cx * n - size.width / 2 / ts;
-	ty0 = _cy * n - size.height / 2 / ts;
-	x0 = (long)floor(tx0);
-	x1 = (long)floor(tx0 + size.width / ts);
-	y0 = MAX(0, (long)floor(ty0));
-	y1 = MIN(n - 1, (long)floor(ty0 + size.height / ts));
-
-	slots = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)MAX(0, (x1 - x0 + 1) * (y1 - y0 + 1))];
-	for (long y = y0; y <= y1; y++) {
-		for (long x = x0; x <= x1; x++) {
-			NSNumber *key = @(tile_id(level, x, y));
-			MapTileSlot *slot = _slots[key];
-			BOOL fresh = slot == nil;
-			/* (edges rounded to whole pixels, each from its own tile number, so that neighbours share them exactly
-			   and no hairline of the background shows between them) */
-			CGFloat left = [self snap:(x - tx0) * ts], right = [self snap:(x + 1 - tx0) * ts];
-			CGFloat top = [self snap:(y - ty0) * ts], bottom = [self snap:(y + 1 - ty0) * ts];
-			CGRect frame = CGRectMake(left, top, right - left, bottom - top);
-
-			if (fresh) {
-				slot = [self slotAt:level x:x y:y];
-				changed = YES;
-			} else {
-				[_slots removeObjectForKey:key];
-			}
-			slots[key] = slot;
-			if (!CGRectEqualToRect(frame, slot->frame)) {
-				slot->frame = frame;
-				slot->layer.frame = frame;
-				if (!fresh) {
-					[self placeChildren:slot];
-				}
-			}
-			if (fresh) {
-				[self fill:slot];
-			}
-		}
-	}
-	for (MapTileSlot *gone in _slots.objectEnumerator) {
-		[self retire:gone];
-		changed = YES;
-	}
-	_slots = slots;
-	if (!_zooming && (changed || _wantAgain)) {
-		_wantAgain = NO;
-		[self request];
-	}
-	[self placeUser];
-	[self placePin];
-	[_delegate mapViewDidChange:self];
+	[self setNeedsFrame];
 }
 
-- (MapTileSlot *)slotAt:(int)z x:(long)x y:(long)y
+- (void)sourceTileFailed:(uint64_t)key
 {
-	MapTileSlot *slot = [MapTileSlot new];
-	long n = 1L << z;
-
-	slot->z = z;
-	slot->x = x;
-	slot->y = y;
-	slot->tile = tile_id(z, (x % n + n) % n, y);
-	if (_spare.count > 0) {
-		slot->layer = _spare.lastObject;
-		[_spare removeLastObject];
-	} else {
-		slot->layer = [MapQuietLayer layer];
-		slot->layer.edgeAntialiasingMask = 0;
-	}
-	[_tileHost addSublayer:slot->layer];
-	return slot;
 }
 
-- (void)retire:(MapTileSlot *)slot
-{
-	for (int i = 0; i < 4; i++) {
-		[slot->children[i] removeFromSuperlayer];
-		slot->children[i] = nil;
-	}
-	[slot->layer removeFromSuperlayer];
-	slot->layer.contents = nil;
-	if (_spare.count < 100) {
-		[_spare addObject:slot->layer];
-	}
-}
-
-/* what a slot shows: its tile if it is here, else what stands in for it (see MapTileSlot) */
-- (void)fill:(MapTileSlot *)slot
-{
-	CALayer *layer = slot->layer;
-	int z = slot->z;
-	long x = tile_x(slot->tile), y = slot->y;
-	id image = [_tiles imageFor:slot->tile];
-	BOOL any = NO;
-
-	for (int i = 0; i < 4; i++) {
-		[slot->children[i] removeFromSuperlayer];
-		slot->children[i] = nil;
-	}
-	layer.contentsRect = CGRectMake(0, 0, 1, 1);
-	layer.backgroundColor = _loadingColor.CGColor;
-	layer.contents = image;
-	slot->own = image != nil;
-	if (slot->own) {
-		return;
-	}
-	for (int d = 1; d <= FALLBACK_LEVELS && z - d >= 0; d++) {
-		id above = [_tiles imageFor:tile_id(z - d, x >> d, y >> d)];
-
-		if (above != nil) {
-			double part = 1.0 / (1L << d);
-
-			layer.contents = above;
-			layer.contentsRect = CGRectMake((x & ((1L << d) - 1)) * part, (y & ((1L << d) - 1)) * part, part, part);
-			any = YES;
-			break;
-		}
-	}
-	if (z < MAP_MAX_ZOOM) {
-		for (int i = 0; i < 4; i++) {
-			id below = [_tiles imageFor:tile_id(z + 1, 2 * x + (i & 1), 2 * y + (i >> 1))];
-
-			if (below != nil) {
-				MapQuietLayer *quarter = [MapQuietLayer layer];
-
-				quarter.contents = below;
-				quarter.edgeAntialiasingMask = 0;
-				[layer addSublayer:quarter];
-				slot->children[i] = quarter;
-				any = YES;
-			}
-		}
-		[self placeChildren:slot];
-	}
-	if (!any && [_tiles failed:slot->tile]) {
-		layer.backgroundColor = _failedColor.CGColor;
-	}
-}
-
-- (void)placeChildren:(MapTileSlot *)slot
-{
-	CGSize size = slot->frame.size;
-	CGFloat mx = [self snap:size.width / 2], my = [self snap:size.height / 2];
-
-	for (int i = 0; i < 4; i++) {
-		BOOL right = i & 1, lower = i >> 1;
-
-		slot->children[i].frame = CGRectMake(right ? mx : 0, lower ? my : 0, right ? size.width - mx : mx,
-		    lower ? size.height - my : my);
-	}
-}
-
-/* the tiles of the slots that do not have theirs, nearest the middle of the screen first */
-- (void)request
-{
-	CGSize size = self.bounds.size;
-	CGPoint middle = CGPointMake(size.width / 2, size.height / 2);
-	NSMutableArray<MapTileSlot *> *missing = [NSMutableArray array];
-	NSMutableOrderedSet<NSNumber *> *wanted = [NSMutableOrderedSet orderedSet];
-
-	for (MapTileSlot *slot in _slots.objectEnumerator) {
-		if (!slot->own) {
-			[missing addObject:slot];
-		}
-	}
-	[missing sortUsingComparator:^NSComparisonResult(MapTileSlot *a, MapTileSlot *b) {
-		double da = hypot(CGRectGetMidX(a->frame) - middle.x, CGRectGetMidY(a->frame) - middle.y);
-		double db = hypot(CGRectGetMidX(b->frame) - middle.x, CGRectGetMidY(b->frame) - middle.y);
-
-		return da < db ? NSOrderedAscending : da > db ? NSOrderedDescending : NSOrderedSame;
-	}];
-	for (MapTileSlot *slot in missing) {
-		[wanted addObject:@(slot->tile)];
-	}
-	[_tiles want:wanted.array];
-}
-
-- (void)tileArrived:(uint64_t)tile
-{
-	int z = tile_z(tile);
-
-	/* (its own slots; and, if it is of another level, any slot still waiting, which it may stand in for) */
-	for (MapTileSlot *slot in _slots.objectEnumerator) {
-		if (slot->tile == tile || (!slot->own && slot->z != z)) {
-			[self fill:slot];
-		}
-	}
-}
-
-- (void)tileFailed:(uint64_t)tile
-{
-	for (MapTileSlot *slot in _slots.objectEnumerator) {
-		if (slot->tile == tile && !slot->own) {
-			[self fill:slot];
-		}
-	}
-}
-
-- (void)tilesMayBeRetried
+- (void)sourceMayRetry
 {
 	_wantAgain = YES;
-	if (!_zooming) {
-		_wantAgain = NO;
-		[self request];
-	}
+	[self setNeedsFrame];
 }
 
 - (void)forgetTiles
 {
-	[_tiles forget];
+	[_source forget];
+	_wantAgain = YES;
+	[self setNeedsFrame];
 }
 
 #pragma mark the location and the pin
@@ -912,7 +970,8 @@ pin_image(void)
 	_dot.position = p;
 	_cone.position = p;
 	_cone.hidden = _heading < 0;
-	_cone.affineTransform = CGAffineTransformMakeRotation(_heading * M_PI / 180);
+	/* (the heading is from north; the screen's up is the bearing) */
+	_cone.affineTransform = CGAffineTransformMakeRotation(_heading * M_PI / 180 - _turn);
 }
 
 - (void)showPinAt:(CLLocationCoordinate2D)where title:(NSString *)title
@@ -957,7 +1016,7 @@ pin_image(void)
 	where.textColor = UIColor.secondaryLabelColor;
 	_copy = [UIButton buttonWithType:UIButtonTypeSystem];
 	_copy.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-	[_copy setTitle:@"Copy" forState:UIControlStateNormal];
+	[_copy setTitle:NSLocalizedString(@"Copy", nil) forState:UIControlStateNormal];
 	[_copy addTarget:self action:@selector(copyPin) forControlEvents:UIControlEventTouchUpInside];
 	/* (wide enough for "Copied" too, so that nothing moves when it says so) */
 	[_copy.widthAnchor constraintEqualToConstant:58].active = YES;
@@ -992,10 +1051,15 @@ pin_image(void)
 	UIButton *button = _copy;
 
 	UIPasteboard.generalPasteboard.string = coordinate_text(_pinWhere);
-	[button setTitle:@"Copied" forState:UIControlStateNormal];
+	[button setTitle:NSLocalizedString(@"Copied", nil) forState:UIControlStateNormal];
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-		[button setTitle:@"Copy" forState:UIControlStateNormal];
+		[button setTitle:NSLocalizedString(@"Copy", nil) forState:UIControlStateNormal];
 	});
+}
+
+- (CGFloat)snap:(double)value
+{
+	return round(value * _pixel) / _pixel;
 }
 
 - (void)placePin
@@ -1035,63 +1099,104 @@ pin_image(void)
 	[self stopMotion];
 	/* (animated only when it is near: a long flight would show screenfuls of tiles that are not there) */
 	if (animated && self.window != nil && fabs(zoom - _z) <= 2 && hypot(dx, dy) <= 2 * fmax(size.width, size.height)) {
-		[self animateToX:x y:y zoom:zoom anchored:NO];
+		[self animateToX:x y:y zoom:zoom turn:_turn anchored:NO];
 		return;
 	}
 	_cx = x;
 	_cy = y;
 	_z = zoom;
-	[self update];
+	[self clamp];
+	[self setNeedsFrame];
+}
+
+- (void)setBearing:(double)degrees animated:(BOOL)animated
+{
+	double turn = remainder(degrees * M_PI / 180, 2 * M_PI);
+
+	[self stopMotion];
+	if (animated && self.window != nil) {
+		[self animateToX:_cx y:_cy zoom:_z turn:turn anchored:NO];
+		return;
+	}
+	_turn = turn;
+	[self setNeedsFrame];
 }
 
 - (void)moveBy:(CGPoint)move
 {
-	double ppw = [self ppw];
+	double ppw = [self ppw], c = cos(_turn), s = sin(_turn);
 
-	_cx -= move.x / ppw;
-	_cy -= move.y / ppw;
-	[self update];
+	/* (the fingers move on the screen; the world under them is turned) */
+	_cx -= (c * move.x - s * move.y) / ppw;
+	_cy -= (s * move.x + c * move.y) / ppw;
+	[self clamp];
+	[self setNeedsFrame];
+}
+
+/* the world point at `at` stays where it is while the centre turns or zooms about it */
+- (void)keep:(double)ax y:(double)ay at:(CGPoint)at
+{
+	CGSize size = self.bounds.size;
+	double ppw = [self ppw], c = cos(_turn), s = sin(_turn), dx = at.x - size.width / 2, dy = at.y - size.height / 2;
+
+	_cx = ax - (c * dx - s * dy) / ppw;
+	_cy = ay - (s * dx + c * dy) / ppw;
 }
 
 /* a new zoom about a point: the world point that was at `from` is now at `to` (where the fingers have gone) */
 - (void)zoomTo:(double)zoom from:(CGPoint)from to:(CGPoint)to
 {
-	CGSize size = self.bounds.size;
-	double ax, ay, ppw;
+	double ax, ay;
 
 	if (_followsUser && _userLocation != nil) {
 		from = to = [self pointAtX:_ux y:_uy];
 	}
 	[self worldAt:from x:&ax y:&ay];
 	_z = fmin(MAP_MAX_ZOOM, fmax(MAP_MIN_ZOOM, zoom));
-	ppw = [self ppw];
-	_cx = ax - (to.x - size.width / 2) / ppw;
-	_cy = ay - (to.y - size.height / 2) / ppw;
-	[self update];
+	[self keep:ax y:ay at:to];
+	[self clamp];
+	[self setNeedsFrame];
 }
 
-/* the zooming is over: the nearest level is shown, and its tiles fetched */
+- (void)turnBy:(double)radians about:(CGPoint)at
+{
+	double ax, ay;
+
+	if (_followsUser && _userLocation != nil) {
+		at = [self pointAtX:_ux y:_uy];
+	}
+	[self worldAt:at x:&ax y:&ay];
+	/* (the fingers turning clockwise turn the map clockwise: the top of the screen then points further west) */
+	_turn -= radians;
+	[self keep:ax y:ay at:at];
+	[self clamp];
+	[self setNeedsFrame];
+}
+
+/* the zooming is over: the level for the zoom is shown, and its tiles fetched */
 - (void)endZooming
 {
 	_zooming = NO;
 	_wantAgain = YES;
-	[self update];
+	[self setNeedsFrame];
 }
 
-- (void)animateToX:(double)x y:(double)y zoom:(double)zoom anchored:(BOOL)anchored
+- (void)animateToX:(double)x y:(double)y zoom:(double)zoom turn:(double)turn anchored:(BOOL)anchored
 {
 	_fromX = _cx;
 	_fromY = _cy;
 	_fromZ = _z;
+	_fromTurn = _turn;
 	_toX = _cx + (x - _cx - round(x - _cx));
 	_toY = y;
 	_toZ = zoom;
+	_toTurn = _turn + remainder(turn - _turn, 2 * M_PI);
 	_anchored = anchored;
 	_zooming = fabs(zoom - _z) > 1e-9;
 	_start = CACurrentMediaTime();
-	_duration = 0.3;
+	_duration = fabs(_toTurn - _fromTurn) > 0.5 ? 0.45 : 0.3;
 	_motion = MOTION_ANIMATION;
-	[self startLink];
+	[self setNeedsFrame];
 }
 
 - (void)fling:(CGPoint)velocity
@@ -1100,20 +1205,7 @@ pin_image(void)
 	_velocity = velocity;
 	_last = CACurrentMediaTime();
 	_motion = MOTION_FLING;
-	[self startLink];
-}
-
-- (void)startLink
-{
-	float most = (float)UIScreen.mainScreen.maximumFramesPerSecond;
-
-	if (_link != nil) {
-		return;
-	}
-	/* (as fast as the screen goes: 120 Hz where it can; it only runs while something moves by itself) */
-	_link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-	_link.preferredFrameRateRange = CAFrameRateRangeMake(fminf(60, most), most, most);
-	[_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+	[self setNeedsFrame];
 }
 
 - (void)stopMotion
@@ -1121,17 +1213,14 @@ pin_image(void)
 	BOOL animating = _motion == MOTION_ANIMATION;
 
 	_motion = MOTION_NONE;
-	[_link invalidate];
-	_link = nil;
 	if (animating && !_pinching) {
 		[self endZooming];
 	}
 }
 
-- (void)tick:(CADisplayLink *)link
+/* the motion of the moment, on to `now`; NO: nothing moves by itself */
+- (BOOL)advance:(CFTimeInterval)now
 {
-	CFTimeInterval now = CACurrentMediaTime();
-
 	if (_motion == MOTION_FLING) {
 		/* UIScrollView's own deceleration: the speed is 0.998 of what it was a millisecond before */
 		double dt = fmin(now - _last, 1.0 / 30), keep = pow(0.998, dt * 1000);
@@ -1143,28 +1232,26 @@ pin_image(void)
 		if (hypot(_velocity.x, _velocity.y) < 15) {
 			[self stopMotion];
 		}
-	} else if (_motion == MOTION_ANIMATION) {
+		return YES;
+	}
+	if (_motion == MOTION_ANIMATION) {
 		double t = fmin(1, (now - _start) / _duration), e = 1 - pow(1 - t, 3);
 
 		_z = _fromZ + (_toZ - _fromZ) * e;
+		_turn = _fromTurn + (_toTurn - _fromTurn) * e;
 		if (_anchored) {
-			CGSize size = self.bounds.size;
-			double ppw = [self ppw];
-
-			_cx = _anchorX - (_anchorAt.x - size.width / 2) / ppw;
-			_cy = _anchorY - (_anchorAt.y - size.height / 2) / ppw;
+			[self keep:_anchorX y:_anchorY at:_anchorAt];
 		} else {
 			_cx = _fromX + (_toX - _fromX) * e;
 			_cy = _fromY + (_toY - _fromY) * e;
 		}
+		[self clamp];
 		if (t >= 1) {
 			[self stopMotion];
-		} else {
-			[self update];
 		}
-	} else {
-		[self stopMotion];
+		return YES;
 	}
+	return NO;
 }
 
 #pragma mark the gestures
@@ -1257,6 +1344,38 @@ pin_image(void)
 	}
 }
 
+- (void)rotate:(UIRotationGestureRecognizer *)rotation
+{
+	double turn = rotation.rotation;
+
+	rotation.rotation = 0;
+	switch (rotation.state) {
+	case UIGestureRecognizerStateBegan:
+		_turning = NO;
+		_rotationHeld = 0;
+		[_delegate mapViewWillMove:self dragged:NO];
+		__attribute__((fallthrough));
+	case UIGestureRecognizerStateChanged:
+		if (rotation.numberOfTouches < 2) {
+			return;
+		}
+		/* (a pinch's fingers turn a little: the map turns once they have turned 12 degrees, and from there on) */
+		if (!_turning) {
+			_rotationHeld += turn;
+			if (fabs(_rotationHeld) < 12 * M_PI / 180) {
+				return;
+			}
+			_turning = YES;
+			turn = 0;
+		}
+		[self turnBy:turn about:[rotation locationInView:self]];
+		break;
+	default:
+		_turning = NO;
+		break;
+	}
+}
+
 - (void)doubleTap:(UITapGestureRecognizer *)tap
 {
 	[self zoomBy:1 at:[tap locationInView:self]];
@@ -1267,7 +1386,7 @@ pin_image(void)
 	[self zoomBy:-1 at:[tap locationInView:self]];
 }
 
-/* a level in or out, animated, about the point tapped (to a whole level: its tiles are then shown at their size) */
+/* a level in or out, animated, about the point tapped */
 - (void)zoomBy:(double)step at:(CGPoint)at
 {
 	double zoom = fmin(MAP_MAX_ZOOM, fmax(MAP_MIN_ZOOM, round(_z + step)));
@@ -1279,7 +1398,7 @@ pin_image(void)
 	}
 	[self worldAt:at x:&_anchorX y:&_anchorY];
 	_anchorAt = at;
-	[self animateToX:_cx y:_cy zoom:zoom anchored:YES];
+	[self animateToX:_cx y:_cy zoom:zoom turn:_turn anchored:YES];
 }
 
 - (void)press:(UILongPressGestureRecognizer *)press
@@ -1293,7 +1412,7 @@ pin_image(void)
 	if (y < 0 || y > 1) {
 		return;
 	}
-	[self showPinAt:CLLocationCoordinate2DMake(latitude_at(y), longitude_at(x)) title:@"Dropped pin"];
+	[self showPinAt:CLLocationCoordinate2DMake(latitude_at(y), longitude_at(x)) title:NSLocalizedString(@"Dropped pin", nil)];
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer shouldReceiveTouch:(UITouch *)touch
@@ -1305,7 +1424,176 @@ pin_image(void)
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)one
     shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other
 {
-	return (one == _panner && other == _pincher) || (one == _pincher && other == _panner);
+	NSArray *together = @[ _panner, _pincher, _rotator ];
+
+	return [together containsObject:one] && [together containsObject:other];
+}
+
+#pragma mark the self-test
+
+/* what a frame read back shows: how much of it is not the background, how many colours (in steps of 16) */
+static NSArray<NSString *> *
+look_at(const uint8_t *rgba, size_t width, size_t height, const float *background)
+{
+	uint8_t bg[3] = { (uint8_t)lround(background[0] * 255), (uint8_t)lround(background[1] * 255),
+	    (uint8_t)lround(background[2] * 255) };
+	static uint8_t seen[4096];
+	size_t drawn = 0, total = 0, colours = 0;
+
+	if (rgba == NULL) {
+		return @[ @"readback: failed" ];
+	}
+	memset(seen, 0, sizeof(seen));
+	for (size_t y = 0; y < height; y += 2) {
+		for (size_t x = 0; x < width; x += 2) {
+			const uint8_t *p = rgba + (y * width + x) * 4;
+			unsigned bin = (p[0] >> 4) << 8 | (p[1] >> 4) << 4 | p[2] >> 4;
+
+			total++;
+			if (abs(p[0] - bg[0]) > 6 || abs(p[1] - bg[1]) > 6 || abs(p[2] - bg[2]) > 6) {
+				drawn++;
+			}
+			if (!seen[bin]) {
+				seen[bin] = 1;
+				colours++;
+			}
+		}
+	}
+	return @[
+		[NSString stringWithFormat:@"readback: %zux%zu", width, height],
+		[NSString stringWithFormat:@"drawn: %.1f%% of the pixels are not the background", total ? 100.0 * drawn / total : 0],
+		[NSString stringWithFormat:@"colours: %zu", colours],
+	];
+}
+
+- (void)testAt:(CLLocationCoordinate2D)where zoom:(double)zoom renderer:(MapRendererKind)kind samples:(unsigned)samples
+    done:(void (^)(NSArray<NSString *> *lines))done
+{
+	__weak MapView *weak = self;
+	CFTimeInterval began = CACurrentMediaTime();
+	__block int stage = 0;
+	__block CFTimeInterval stageBegan = began, waited = 0;
+	__block unsigned frames = 0;
+	__block double worst = 0, spent = 0;
+	NSMutableArray<NSString *> *lines = [NSMutableArray array];
+
+	[self stopMotion];
+	_samples = samples > 1 ? 4 : 1;
+	_rendererKind = kind;
+	[self makeRenderer];
+	_turn = 0;
+	[self setCenterCoordinate:where zoom:zoom animated:NO];
+	[lines addObject:[NSString stringWithFormat:@"renderer: %@ (asked for %@, %u samples)", _renderer.name ?: @"none",
+	    kind == MapRendererKindMetal ? @"Metal" : @"OpenGL ES", _samples]];
+	[lines addObject:[NSString stringWithFormat:@"at: %@ zoom %.1f", coordinate_text(where), zoom]];
+	_test = ^{
+		MapView *me = weak;
+		CFTimeInterval now = CACurrentMediaTime();
+
+		if (me == nil) {
+			return;
+		}
+		[me setNeedsFrame];
+		switch (stage) {
+		case 0: {
+			/* the tiles: all of the screen's own, or 30 seconds */
+			BOOL all = me->_slotCount > 0;
+
+			for (unsigned i = 0; i < me->_slotCount && all; i++) {
+				const struct slot *slot = &me->_slots[i];
+				long n = 1L << slot->z;
+
+				all = [me->_source tileFor:tile_id(slot->z, (slot->x % n + n) % n, slot->y)].gpu != nil;
+			}
+			if ((all && !me->_labels.pending) || now - stageBegan > 30) {
+				waited = now - stageBegan;
+				[lines addObject:[NSString stringWithFormat:@"tiles: %u on the screen, %@ after %.1f s; %lu downloaded, "
+				    "%lu made%@", me->_slotCount, all ? @"all there" : @"NOT all there", waited,
+				    (unsigned long)me->_source.downloads, (unsigned long)me->_source.made,
+				    me->_source.problem ? [@"; last problem: " stringByAppendingString:me->_source.problem] : @""]];
+				{
+					unsigned triangles = 0;
+
+					for (unsigned i = 0; i < me->_slotCount; i++) {
+						const struct slot *slot = &me->_slots[i];
+						long n = 1L << slot->z;
+						MapTile *tile = [me->_source tileFor:tile_id(slot->z, (slot->x % n + n) % n, slot->y)];
+
+						triangles += tile.mesh->triangles;
+					}
+					[lines addObject:[NSString stringWithFormat:@"triangles: %u; pieces %u; labels %u", triangles,
+					    me->_pieceCount, me->_labels.placed]];
+				}
+				stage = 1;
+				stageBegan = now;
+			}
+			break;
+		}
+		case 1: {
+			/* a frame read back */
+			stage = 2;
+			[me->_renderer captureNextFrame:^(const uint8_t *rgba, size_t width, size_t height) {
+				float bg[4];
+
+				premultiplied(style_background(me.dark), bg);
+				[lines addObjectsFromArray:look_at(rgba, width, height, bg)];
+				stage = 3;
+				stageBegan = CACurrentMediaTime();
+				frames = 0;
+				spent = 0;
+				worst = 0;
+				me->_spentTiles = me->_spentLabels = me->_spentDraw = 0;
+			}];
+			break;
+		}
+		case 2:
+			if (now - stageBegan > 5) {
+				[lines addObject:@"readback: no frame came back in 5 s"];
+				stage = 3;
+				stageBegan = now;
+			}
+			break;
+		case 3: {
+			/* four seconds still (for a screenshot of it), then three of motion: turning a quarter round and zooming
+			   one level in and out again */
+			double t = (now - stageBegan - 4) / 3;
+
+			if (t < 0) {
+				me->_spentTiles = me->_spentLabels = me->_spentDraw = 0;
+				(void)[me->_renderer timing];
+				break;
+			}
+			if (t < 1) {
+				if (frames > 0) {
+					/* (the frame drawn at this tick, of the camera set at the last one) */
+					spent += me->_lastFrame;
+					worst = fmax(worst, me->_lastFrame);
+				}
+				me->_turn = t * M_PI / 2;
+				me->_z = zoom + sin(t * M_PI);
+				frames++;
+			} else {
+				[lines addObject:[NSString stringWithFormat:@"motion: %.0f frames a second over 3 s (the screen goes up "
+				    "to %ld); the processor %.1f ms a frame, at most %.1f", frames / 3.0,
+				    (long)UIScreen.mainScreen.maximumFramesPerSecond, frames > 1 ? 1000 * spent / (frames - 1) : 0,
+				    1000 * worst]];
+				[lines addObject:[NSString stringWithFormat:@"parts: tiles and pieces %.1f ms a frame, labels %.1f, the "
+				    "renderer %.1f (its present included)", frames ? 1000 * me->_spentTiles / frames : 0,
+				    frames ? 1000 * me->_spentLabels / frames : 0, frames ? 1000 * me->_spentDraw / frames : 0]];
+				[lines addObject:[@"in the renderer: " stringByAppendingString:[me->_renderer timing]]];
+				me->_turn = 0;
+				me->_z = zoom;
+				me->_test = nil;
+				[lines addObject:[NSString stringWithFormat:@"took: %.1f s", now - began]];
+				done(lines);
+			}
+			break;
+		}
+		default:
+			break;
+		}
+	};
+	[self setNeedsFrame];
 }
 
 @end

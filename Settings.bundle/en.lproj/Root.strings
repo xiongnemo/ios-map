@@ -1,0 +1,14 @@
+"Drawing" = "Drawing";
+"Both draw the same map. Metal is used only where the device lets this app have it; otherwise the map is drawn with OpenGL ES." = "Both draw the same map. Metal is used only where the device lets this app have it; otherwise the map is drawn with OpenGL ES.";
+"Renderer" = "Renderer";
+"Show Frame Rate" = "Show Frame Rate";
+"Look" = "Look";
+"Style" = "Style";
+"Follow System" = "Follow System";
+"Light" = "Light";
+"Dark" = "Dark";
+"Place Names" = "Place Names";
+"Local Names" = "Local Names";
+"Chinese First" = "Chinese First";
+"English First" = "English First";
+"Data" = "Data";

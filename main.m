@@ -1,18 +1,91 @@
-// Map: OpenStreetMap drawn on the CPU -- raster tiles laid out as Core Animation layers (MapView.m), a search through
-// Nominatim, the location as a blue dot with its accuracy and, when asked for, the heading as a cone. Written for the
-// iOS 16.5 port to the Redmi K40, where Apple's Maps and MapKit show nothing (they draw with Metal, which the port does
-// not have); on an iPhone it is an ordinary application. This file is the screen around the map: the search bar and
-// its results, the locate button, the scale bar, the attribution, and the location manager. build.sh builds it into
-// Map.ipa (mkicon.py its icon).
+// Map: OpenStreetMap as vector tiles drawn by the GPU (MapView.m) -- with OpenGL ES or with Metal, as the settings
+// say -- a search through Nominatim, the location as a blue dot with its accuracy and, when asked for, the heading as a
+// cone. Written for the iOS 16.5 port to the Redmi K40, where Apple's Maps cannot get its data (that needs Apple's
+// servers to know the phone); on an iPhone it is an ordinary application. This file is the screen around the map: the
+// search bar and its results, the locate, compass and settings buttons, the scale bar, the attribution, the settings
+// and the location manager. build.sh builds it into Map.ipa (mkicon.py its icon).
+//
+// map://test?renderer=gl|metal|both&at=LATITUDE,LONGITUDE,ZOOM runs the self-test (MapView's testAt:) and says what it
+// found on the console, a line each, after "mapcheck: ".
 #import <CoreLocation/CoreLocation.h>
 #import <UIKit/UIKit.h>
 #import "MapView.h"
 
 static NSString *const search_url = @"https://nominatim.openstreetmap.org/search";
-static NSString *const copyright_url = @"https://www.openstreetmap.org/copyright";
 
 /* where the map was, kept for the next launch */
 static NSString *const saved_latitude = @"Latitude", *const saved_longitude = @"Longitude", *const saved_zoom = @"Zoom";
+static NSString *const saved_bearing = @"Bearing";
+
+/* the settings, iOS's Settings (Settings.bundle) and the gear's: the same keys */
+static NSString *const setting_renderer = @"Renderer", *const setting_style = @"Style";
+static NSString *const setting_language = @"LabelLanguage", *const setting_rate = @"ShowFrameRate";
+
+/*
+ * A line of what the app found, for whoever tests it: on the console after "mapcheck: ", and at the end of
+ * Documents/mapcheck.log (a test harness that cannot read the console fetches that).
+ */
+static void
+map_say(NSString *line)
+{
+	static NSFileHandle *log;
+	static dispatch_once_t once;
+
+	NSLog(@"mapcheck: %@", line);
+	dispatch_once(&once, ^{
+		NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory
+		    inDomains:NSUserDomainMask].firstObject;
+		NSString *path = [documents URLByAppendingPathComponent:@"mapcheck.log"].path;
+
+		if (path != nil && ([NSFileManager.defaultManager fileExistsAtPath:path] ||
+		    [NSFileManager.defaultManager createFileAtPath:path contents:nil attributes:nil])) {
+			log = [NSFileHandle fileHandleForWritingAtPath:path];
+			[log seekToEndOfFile];
+		}
+	});
+	[log writeData:[[NSString stringWithFormat:@"%@ %@\n", [NSDate date], line]
+	    dataUsingEncoding:NSUTF8StringEncoding]];
+}
+
+static NSString *
+authorization_name(CLAuthorizationStatus status)
+{
+	switch (status) {
+	case kCLAuthorizationStatusNotDetermined:
+		return @"not determined";
+	case kCLAuthorizationStatusRestricted:
+		return @"restricted";
+	case kCLAuthorizationStatusDenied:
+		return @"denied";
+	case kCLAuthorizationStatusAuthorizedAlways:
+		return @"always";
+	case kCLAuthorizationStatusAuthorizedWhenInUse:
+		return @"when in use";
+	}
+	return [NSString stringWithFormat:@"%d", (int)status];
+}
+
+/* the place names the settings ask for, "system" being the phone's first language */
+static enum style_language
+language_for(NSString *setting)
+{
+	NSString *first = NSLocale.preferredLanguages.firstObject ?: @"en";
+	/* (Chinese in the phone's script: zh-Hant, zh-TW, zh-HK, zh-MO are Traditional; the rest Simplified) */
+	BOOL traditional = [first hasPrefix:@"zh-Hant"] || [first hasPrefix:@"zh-TW"] || [first hasPrefix:@"zh-HK"] ||
+	    [first hasPrefix:@"zh-MO"];
+	enum style_language chinese = traditional ? LANGUAGE_CHINESE_TRADITIONAL : LANGUAGE_CHINESE;
+
+	if ([setting isEqualToString:@"local"]) {
+		return LANGUAGE_LOCAL;
+	}
+	if ([setting isEqualToString:@"zh"]) {
+		return chinese;
+	}
+	if ([setting isEqualToString:@"en"]) {
+		return LANGUAGE_ENGLISH;
+	}
+	return [first hasPrefix:@"zh"] ? chinese : [first hasPrefix:@"en"] ? LANGUAGE_ENGLISH : LANGUAGE_LOCAL;
+}
 
 enum { FOLLOW_NONE, FOLLOW_LOCATION, FOLLOW_HEADING };
 
@@ -136,12 +209,22 @@ languages(void)
 
 /* The scale bar, bottom left: a bar of a round length of at most 100 points, the length, and the zoom, small. */
 @interface MapScaleBar : UIView
+/* on a dark map: a dark plate, light lines */
+@property (nonatomic) BOOL dark;
 - (void)showMetresPerPoint:(double)metres zoom:(double)zoom;
 @end
 
 @implementation MapScaleBar {
 	NSString *_length, *_level;
 	CGFloat _width;
+}
+
+- (void)setDark:(BOOL)dark
+{
+	if (dark != _dark) {
+		_dark = dark;
+		[self setNeedsDisplay];
+	}
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -183,10 +266,11 @@ languages(void)
 
 - (void)drawRect:(CGRect)rect
 {
+	UIColor *ink = _dark ? [UIColor colorWithWhite:0.85 alpha:1] : UIColor.blackColor;
 	NSDictionary *bold = @{ NSFontAttributeName: [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold],
-	    NSForegroundColorAttributeName: UIColor.blackColor };
+	    NSForegroundColorAttributeName: ink };
 	NSDictionary *light = @{ NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightRegular],
-	    NSForegroundColorAttributeName: [UIColor colorWithWhite:0.3 alpha:1] };
+	    NSForegroundColorAttributeName: [UIColor colorWithWhite:_dark ? 0.6 : 0.3 alpha:1] };
 	UIBezierPath *bar = [UIBezierPath bezierPath];
 	CGSize length, level;
 	CGFloat plate;
@@ -197,8 +281,8 @@ languages(void)
 	length = [_length sizeWithAttributes:bold];
 	level = [_level sizeWithAttributes:light];
 	plate = fmin(self.bounds.size.width, fmax(_width, length.width + 6 + level.width) + 10);
-	/* (on a pale plate: the map under it may be anything) */
-	[[UIColor colorWithWhite:1 alpha:0.75] setFill];
+	/* (on a plate, pale or dark as the map is: the map under it may be anything) */
+	[[UIColor colorWithWhite:_dark ? 0 : 1 alpha:_dark ? 0.55 : 0.75] setFill];
 	[[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, plate, self.bounds.size.height) cornerRadius:5] fill];
 	[_length drawAtPoint:CGPointMake(5, 2) withAttributes:bold];
 	[_level drawAtPoint:CGPointMake(5 + length.width + 6, 3) withAttributes:light];
@@ -207,7 +291,7 @@ languages(void)
 	[bar addLineToPoint:CGPointMake(5 + _width, 25)];
 	[bar addLineToPoint:CGPointMake(5 + _width, 18)];
 	bar.lineWidth = 2;
-	[UIColor.blackColor setStroke];
+	[ink setStroke];
 	[bar stroke];
 }
 
@@ -233,8 +317,128 @@ languages(void)
 
 @end
 
+/* The gear's sheet: the settings iOS's Settings has for the app, written to the same keys (the map follows them). */
+@interface MapSettingsController : UIViewController
+@property (weak, nonatomic) MapView *map;
+@end
+
+@implementation MapSettingsController {
+	UISegmentedControl *_renderer, *_style, *_language;
+	UISwitch *_rate;
+	UILabel *_note;
+}
+
+static NSArray<NSString *> *
+style_values(void)
+{
+	return @[ @"system", @"light", @"dark" ];
+}
+
+static NSArray<NSString *> *
+language_values(void)
+{
+	return @[ @"system", @"local", @"zh", @"en" ];
+}
+
+- (UIView *)row:(NSString *)title control:(UIView *)control
+{
+	UILabel *label = [UILabel new];
+	UIStackView *row;
+
+	label.text = title;
+	label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+	label.textColor = UIColor.secondaryLabelColor;
+	row = [[UIStackView alloc] initWithArrangedSubviews:@[ label, control ]];
+	row.axis = [control isKindOfClass:UISwitch.class] ? UILayoutConstraintAxisHorizontal : UILayoutConstraintAxisVertical;
+	row.spacing = 6;
+	row.alignment = [control isKindOfClass:UISwitch.class] ? UIStackViewAlignmentCenter : UIStackViewAlignmentFill;
+	return row;
+}
+
+- (void)viewDidLoad
+{
+	NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+	NSString *metal = map_metal_problem();
+	NSUInteger style = [style_values() indexOfObject:[defaults stringForKey:setting_style] ?: @"system"];
+	NSUInteger language = [language_values() indexOfObject:[defaults stringForKey:setting_language] ?: @"system"];
+	UIStackView *stack;
+
+	[super viewDidLoad];
+	self.view.backgroundColor = UIColor.systemBackgroundColor;
+	self.title = NSLocalizedString(@"Map Settings", nil);
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+	    target:self action:@selector(done)];
+	_renderer = [[UISegmentedControl alloc] initWithItems:@[ @"OpenGL ES", @"Metal" ]];
+	[_renderer setEnabled:metal == nil forSegmentAtIndex:1];
+	_renderer.selectedSegmentIndex = metal == nil && [[defaults stringForKey:setting_renderer] isEqualToString:@"metal"];
+	_style = [[UISegmentedControl alloc] initWithItems:@[ NSLocalizedString(@"System", nil), NSLocalizedString(@"Light", nil),
+	    NSLocalizedString(@"Dark", nil) ]];
+	_style.selectedSegmentIndex = style == NSNotFound ? 0 : (NSInteger)style;
+	_language = [[UISegmentedControl alloc] initWithItems:@[ NSLocalizedString(@"System", nil),
+	    NSLocalizedString(@"Local", nil), NSLocalizedString(@"Chinese", nil), NSLocalizedString(@"English", nil) ]];
+	_language.selectedSegmentIndex = language == NSNotFound ? 0 : (NSInteger)language;
+	_rate = [UISwitch new];
+	_rate.on = [defaults boolForKey:setting_rate];
+	for (UIControl *control in @[ _renderer, _style, _language, _rate ]) {
+		[control addTarget:self action:@selector(changed) forControlEvents:UIControlEventValueChanged];
+	}
+	_note = [UILabel new];
+	_note.numberOfLines = 0;
+	_note.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+	_note.textColor = UIColor.secondaryLabelColor;
+	[self showNote];
+	stack = [[UIStackView alloc] initWithArrangedSubviews:@[
+		[self row:NSLocalizedString(@"Renderer", nil) control:_renderer],
+		[self row:NSLocalizedString(@"Style", nil) control:_style],
+		[self row:NSLocalizedString(@"Place Names", nil) control:_language],
+		[self row:NSLocalizedString(@"Show Frame Rate", nil) control:_rate],
+		_note,
+	]];
+	stack.axis = UILayoutConstraintAxisVertical;
+	stack.spacing = 20;
+	stack.translatesAutoresizingMaskIntoConstraints = NO;
+	[self.view addSubview:stack];
+	[NSLayoutConstraint activateConstraints:@[
+		[stack.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
+		[stack.leadingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:20],
+		[stack.trailingAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-20],
+	]];
+}
+
+- (void)showNote
+{
+	NSString *metal = map_metal_problem();
+	NSString *text = [NSString stringWithFormat:NSLocalizedString(@"Drawing with %@.", nil), _map.rendererName ?: @"-"];
+
+	if (metal != nil) {
+		text = [text stringByAppendingFormat:@" %@", [NSString stringWithFormat:NSLocalizedString(@"Metal: %@.", nil),
+		    NSLocalizedString(metal, nil)]];
+	}
+	_note.text = [text stringByAppendingString:@"\n\n© OpenFreeMap © OpenMapTiles © OpenStreetMap contributors"];
+}
+
+- (void)changed
+{
+	NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+
+	/* (the map hears of it through NSUserDefaultsDidChangeNotification, at once, on this thread) */
+	[defaults setObject:_renderer.selectedSegmentIndex == 1 ? @"metal" : @"gl" forKey:setting_renderer];
+	[defaults setObject:style_values()[(NSUInteger)MAX(0, _style.selectedSegmentIndex)] forKey:setting_style];
+	[defaults setObject:language_values()[(NSUInteger)MAX(0, _language.selectedSegmentIndex)] forKey:setting_language];
+	[defaults setBool:_rate.on forKey:setting_rate];
+	[self showNote];
+}
+
+- (void)done
+{
+	[self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
 @interface MapController : UIViewController <CLLocationManagerDelegate, MapViewDelegate, UISearchBarDelegate,
     UITableViewDataSource, UITableViewDelegate>
+- (void)runTest:(NSURL *)url;
 @end
 
 @implementation MapController {
@@ -254,8 +458,11 @@ languages(void)
 	int _follow;
 	BOOL _updating;                 /* the location is being updated (allowed, and in the foreground) */
 	BOOL _placed;                   /* the map shows a place on purpose: the first location does not move it */
-	UIButton *_locate;
+	UIButton *_locate, *_gear, *_compass;
 	MapScaleBar *_scale;
+	MapCredit *_credit;
+	UIView *_card;                  /* the search bar and its results */
+	BOOL _testing;
 }
 
 - (void)viewDidLoad
@@ -265,9 +472,14 @@ languages(void)
 
 	[super viewDidLoad];
 	self.view.backgroundColor = UIColor.systemBackgroundColor;
+	/* (what Settings.bundle says too: iOS's Settings writes its values only once they are changed there) */
+	[NSUserDefaults.standardUserDefaults registerDefaults:@{
+		setting_renderer: @"gl", setting_style: @"system", setting_language: @"system", setting_rate: @NO,
+	}];
 	_map = [[MapView alloc] initWithFrame:self.view.bounds];
 	_map.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 	_map.delegate = self;
+	[self applySettings];
 	[self.view addSubview:_map];
 
 	config.HTTPAdditionalHeaders = @{ @"User-Agent": user_agent() };
@@ -287,12 +499,31 @@ languages(void)
 	[center addObserver:self selector:@selector(becameActive) name:UIApplicationDidBecomeActiveNotification object:nil];
 	[center addObserver:self selector:@selector(resignedActive) name:UIApplicationWillResignActiveNotification
 	    object:nil];
+	/* (the gear writes them, and iOS's Settings while the app was away: either way the map follows) */
+	[center addObserver:self selector:@selector(applySettings) name:NSUserDefaultsDidChangeNotification object:nil];
+}
+
+/* the settings, as the map is to be drawn (a self-test chooses its renderer itself until it is done) */
+- (void)applySettings
+{
+	NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+	NSString *style = [defaults stringForKey:setting_style];
+
+	if (_testing) {
+		return;
+	}
+	_map.samples = 4;
+	_map.rendererKind = [[defaults stringForKey:setting_renderer] isEqualToString:@"metal"] ? MapRendererKindMetal :
+	    MapRendererKindGL;
+	_map.style = [style isEqualToString:@"light"] ? MapStyleLight : [style isEqualToString:@"dark"] ? MapStyleDark :
+	    MapStyleSystem;
+	_map.labelLanguage = language_for([defaults stringForKey:setting_language]);
+	_map.showsFrameRate = [defaults boolForKey:setting_rate];
 }
 
 - (UIStatusBarStyle)preferredStatusBarStyle
 {
-	/* (the map is light, in dark mode too) */
-	return UIStatusBarStyleDarkContent;
+	return _map.dark ? UIStatusBarStyleLightContent : UIStatusBarStyleDarkContent;
 }
 
 - (void)makeSearch
@@ -301,6 +532,7 @@ languages(void)
 	UIView *card = [UIView new];
 	NSLayoutConstraint *wide;
 
+	_card = card;
 	card.backgroundColor = UIColor.systemBackgroundColor;
 	card.layer.cornerRadius = 12;
 	card.layer.borderWidth = 1 / UIScreen.mainScreen.scale;
@@ -308,7 +540,7 @@ languages(void)
 	card.clipsToBounds = YES;
 	_search = [UISearchBar new];
 	_search.searchBarStyle = UISearchBarStyleMinimal;
-	_search.placeholder = @"Search places";
+	_search.placeholder = NSLocalizedString(@"Search places", nil);
 	_search.returnKeyType = UIReturnKeySearch;
 	_search.autocorrectionType = UITextAutocorrectionTypeNo;
 	_search.delegate = self;
@@ -345,33 +577,52 @@ languages(void)
 	]];
 }
 
+/* a round-cornered button of the map's, with a system symbol (or a character, where the symbols are not) */
+static UIButton *
+map_button(NSString *symbol, NSString *mark, NSString *name)
+{
+	UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+	UIImage *image = [UIImage systemImageNamed:symbol withConfiguration:[UIImageSymbolConfiguration
+	    configurationWithPointSize:18 weight:UIImageSymbolWeightMedium]];
+
+	button.backgroundColor = UIColor.systemBackgroundColor;
+	button.layer.cornerRadius = 10;
+	button.layer.borderWidth = 1 / UIScreen.mainScreen.scale;
+	button.layer.borderColor = UIColor.separatorColor.CGColor;
+	[button setImage:image forState:UIControlStateNormal];
+	[button setTitle:image == nil ? mark : nil forState:UIControlStateNormal];
+	button.accessibilityLabel = name;
+	return button;
+}
+
 - (void)makeControls
 {
 	UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
 	MapCredit *credit = [MapCredit new];
 
-	/* OSM's licence asks for this to be seen; tapped, it opens the page that says what it means */
-	credit.text = @"© OpenStreetMap contributors";
-	credit.font = [UIFont systemFontOfSize:11];
-	credit.textColor = [UIColor colorWithWhite:0.15 alpha:1];
+	/* the data's licences ask for this to be seen; tapped, it offers the pages that say what it means */
+	_credit = credit;
+	credit.text = @"© OpenFreeMap © OpenMapTiles © OpenStreetMap";
+	credit.font = [UIFont systemFontOfSize:10];
 	/* (the layer's own colour, which the rounded corners clip; a label's backgroundColor would be drawn square) */
-	credit.layer.backgroundColor = [UIColor colorWithWhite:1 alpha:0.75].CGColor;
 	credit.layer.cornerRadius = 4;
 	credit.userInteractionEnabled = YES;
 	credit.accessibilityTraits = UIAccessibilityTraitLink;
 	[credit addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openCredits)]];
 
-	_locate = [UIButton buttonWithType:UIButtonTypeSystem];
-	_locate.backgroundColor = UIColor.systemBackgroundColor;
-	_locate.layer.cornerRadius = 10;
-	_locate.layer.borderWidth = 1 / UIScreen.mainScreen.scale;
-	_locate.layer.borderColor = UIColor.separatorColor.CGColor;
+	_locate = map_button(@"location", @"◎", @"Follow my location");
 	[_locate addTarget:self action:@selector(locate) forControlEvents:UIControlEventTouchUpInside];
 	[self showFollow];
+	_gear = map_button(@"gearshape", @"⚙", NSLocalizedString(@"Settings", nil));
+	[_gear addTarget:self action:@selector(openSettings) forControlEvents:UIControlEventTouchUpInside];
+	/* (shown while the map is turned: it points north, and tapped turns the map back) */
+	_compass = map_button(@"location.north.line", @"N", NSLocalizedString(@"North up", nil));
+	[_compass addTarget:self action:@selector(northUp) forControlEvents:UIControlEventTouchUpInside];
+	_compass.hidden = YES;
 
 	_scale = [MapScaleBar new];
 
-	for (UIView *view in @[ credit, _locate, _scale ]) {
+	for (UIView *view in @[ credit, _locate, _gear, _compass, _scale ]) {
 		view.translatesAutoresizingMaskIntoConstraints = NO;
 		[self.view addSubview:view];
 	}
@@ -382,11 +633,50 @@ languages(void)
 		[_locate.bottomAnchor constraintEqualToAnchor:credit.topAnchor constant:-10],
 		[_locate.widthAnchor constraintEqualToConstant:44],
 		[_locate.heightAnchor constraintEqualToConstant:44],
+		[_gear.trailingAnchor constraintEqualToAnchor:_locate.trailingAnchor],
+		[_gear.bottomAnchor constraintEqualToAnchor:_locate.topAnchor constant:-10],
+		[_gear.widthAnchor constraintEqualToConstant:44],
+		[_gear.heightAnchor constraintEqualToConstant:44],
+		[_compass.trailingAnchor constraintEqualToAnchor:_locate.trailingAnchor],
+		[_compass.bottomAnchor constraintEqualToAnchor:_gear.topAnchor constant:-10],
+		[_compass.widthAnchor constraintEqualToConstant:44],
+		[_compass.heightAnchor constraintEqualToConstant:44],
 		[_scale.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:8],
 		[_scale.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-4],
 		[_scale.widthAnchor constraintEqualToConstant:150],
 		[_scale.heightAnchor constraintEqualToConstant:30],
 	]];
+	[self showLook];
+}
+
+/* the scale bar and the attribution as dark or light as the map */
+- (void)showLook
+{
+	BOOL dark = _map.dark;
+
+	_scale.dark = dark;
+	_credit.textColor = dark ? [UIColor colorWithWhite:0.8 alpha:1] : [UIColor colorWithWhite:0.15 alpha:1];
+	_credit.layer.backgroundColor = [UIColor colorWithWhite:dark ? 0 : 1 alpha:dark ? 0.55 : 0.75].CGColor;
+	[self setNeedsStatusBarAppearanceUpdate];
+}
+
+- (void)openSettings
+{
+	MapSettingsController *settings = [MapSettingsController new];
+	UINavigationController *sheet = [[UINavigationController alloc] initWithRootViewController:settings];
+
+	settings.map = _map;
+	if (@available(iOS 15.0, *)) {
+		sheet.sheetPresentationController.detents = @[ UISheetPresentationControllerDetent.mediumDetent,
+		    UISheetPresentationControllerDetent.largeDetent ];
+		sheet.sheetPresentationController.prefersGrabberVisible = YES;
+	}
+	[self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)northUp
+{
+	[_map setBearing:0 animated:YES];
 }
 
 /* Where the map was when the app last went away; else the last location known; else the world. */
@@ -398,6 +688,7 @@ languages(void)
 	if ([defaults objectForKey:saved_zoom] != nil) {
 		[_map setCenterCoordinate:CLLocationCoordinate2DMake([defaults doubleForKey:saved_latitude],
 		    [defaults doubleForKey:saved_longitude]) zoom:[defaults doubleForKey:saved_zoom] animated:NO];
+		[_map setBearing:[defaults doubleForKey:saved_bearing] animated:NO];
 		_placed = YES;
 	} else if (last != nil) {
 		[_map setCenterCoordinate:last.coordinate zoom:15 animated:NO];
@@ -412,9 +703,13 @@ languages(void)
 	NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
 	CLLocationCoordinate2D center = _map.centerCoordinate;
 
+	if (_testing) {
+		return;                 /* (the self-test's place is not the user's) */
+	}
 	[defaults setDouble:center.latitude forKey:saved_latitude];
 	[defaults setDouble:center.longitude forKey:saved_longitude];
 	[defaults setDouble:_map.zoom forKey:saved_zoom];
+	[defaults setDouble:_map.bearing forKey:saved_bearing];
 }
 
 - (void)becameActive
@@ -461,6 +756,24 @@ languages(void)
 	if (_location.headingOrientation != top) {
 		_location.headingOrientation = top;
 	}
+	[self showCovered];
+}
+
+/* where the map is covered by what is over it: no label goes there */
+- (void)showCovered
+{
+	NSMutableArray<NSValue *> *rects = [NSMutableArray array];
+
+	/* (and the status bar's strip: the clock is over it) */
+	[rects addObject:[NSValue valueWithCGRect:CGRectMake(0, 0, self.view.bounds.size.width,
+	    self.view.safeAreaInsets.top)]];
+	for (UIView *view in @[ _card ?: NSNull.null, _locate ?: NSNull.null, _gear ?: NSNull.null,
+	    _compass ?: NSNull.null, _scale ?: NSNull.null, _credit ?: NSNull.null ]) {
+		if ([view isKindOfClass:UIView.class] && !view.hidden && view.window != nil) {
+			[rects addObject:[NSValue valueWithCGRect:[view convertRect:view.bounds toView:_map]]];
+		}
+	}
+	_map.coveredRects = rects;
 }
 
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
@@ -473,10 +786,19 @@ languages(void)
 
 #pragma mark the location
 
+/* what Core Location says of the location for this app: its switch, the app's permission, how precise */
+- (void)sayLocation:(NSString *)when
+{
+	map_say([NSString stringWithFormat:@"location (%@): Location Services %@, this app %@, %@ accuracy", when,
+	    CLLocationManager.locationServicesEnabled ? @"on" : @"OFF", authorization_name(_location.authorizationStatus),
+	    _location.accuracyAuthorization == CLAccuracyAuthorizationFullAccuracy ? @"full" : @"reduced"]);
+}
+
 - (void)startLocation
 {
 	switch (_location.authorizationStatus) {
 	case kCLAuthorizationStatusNotDetermined:
+		map_say(@"location: asking for the permission (requestWhenInUseAuthorization)");
 		[_location requestWhenInUseAuthorization];
 		break;
 	case kCLAuthorizationStatusAuthorizedWhenInUse:
@@ -513,6 +835,7 @@ languages(void)
 
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager
 {
+	[self sayLocation:@"the permission changed"];
 	if (UIApplication.sharedApplication.applicationState != UIApplicationStateBackground) {
 		[self startLocation];
 	}
@@ -524,6 +847,9 @@ languages(void)
 
 	if (where == nil || where.horizontalAccuracy < 0) {
 		return;
+	}
+	if (_map.userLocation == nil) {
+		map_say([NSString stringWithFormat:@"location: the first one, accurate to %.0f m", where.horizontalAccuracy]);
 	}
 	_map.userLocation = where;
 	if (_follow != FOLLOW_NONE) {
@@ -550,6 +876,8 @@ languages(void)
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error
 {
+	map_say([NSString stringWithFormat:@"location: failed: %@ %ld (%@)", error.domain, (long)error.code,
+	    error.localizedDescription]);
 	/* (kCLErrorLocationUnknown only means not yet: Core Location keeps trying) */
 	if ([error.domain isEqualToString:kCLErrorDomain] && error.code == kCLErrorDenied) {
 		[self stopLocation];
@@ -565,6 +893,7 @@ languages(void)
 	CLAuthorizationStatus status = _location.authorizationStatus;
 	CLLocation *where;
 
+	[self sayLocation:@"the locate button"];
 	if (status == kCLAuthorizationStatusNotDetermined) {
 		[_location requestWhenInUseAuthorization];
 		return;
@@ -630,14 +959,132 @@ languages(void)
 
 - (void)openCredits
 {
-	[UIApplication.sharedApplication openURL:[NSURL URLWithString:copyright_url] options:@{} completionHandler:nil];
+	UIAlertController *sheet = [UIAlertController alertControllerWithTitle:nil
+	    message:@"© OpenFreeMap © OpenMapTiles © OpenStreetMap contributors"
+	    preferredStyle:UIAlertControllerStyleActionSheet];
+	NSArray<NSArray<NSString *> *> *pages = @[
+		@[ @"OpenStreetMap", @"https://www.openstreetmap.org/copyright" ],
+		@[ @"OpenMapTiles", @"https://www.openmaptiles.org/" ],
+		@[ @"OpenFreeMap", @"https://openfreemap.org/" ],
+	];
+
+	for (NSArray<NSString *> *page in pages) {
+		[sheet addAction:[UIAlertAction actionWithTitle:page[0] style:UIAlertActionStyleDefault
+		    handler:^(UIAlertAction *action) {
+			[UIApplication.sharedApplication openURL:[NSURL URLWithString:page[1]] options:@{} completionHandler:nil];
+		}]];
+	}
+	[sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+	sheet.popoverPresentationController.sourceView = _credit;
+	[self presentViewController:sheet animated:YES completion:nil];
 }
 
 #pragma mark the map
 
 - (void)mapViewDidChange:(MapView *)map
 {
+	double bearing = map.bearing;
+	BOOL turned = bearing > 0.5 && bearing < 359.5;
+
 	[_scale showMetresPerPoint:map.metresPerPoint zoom:map.zoom];
+	if (_compass.hidden == turned) {
+		_compass.hidden = !turned;
+		[self showCovered];
+	}
+	/* (the compass's needle points to where north is on the screen) */
+	_compass.imageView.transform = CGAffineTransformMakeRotation(-bearing * M_PI / 180);
+}
+
+- (void)mapViewDidChangeLook:(MapView *)map
+{
+	[self showLook];
+}
+
+#pragma mark the self-test
+
+/* map://test?renderer=gl|metal|both&at=LATITUDE,LONGITUDE,ZOOM (the middle of Paris at 15 if not said) */
+- (void)runTest:(NSURL *)url
+{
+	NSURLComponents *parts = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+	NSString *renderer = @"both";
+	double latitude = 48.8566, longitude = 2.3522, zoom = 15;
+	NSMutableArray<NSNumber *> *kinds = [NSMutableArray array];
+
+	for (NSURLQueryItem *item in parts.queryItems) {
+		if ([item.name isEqualToString:@"renderer"] && item.value.length > 0) {
+			renderer = item.value;
+		} else if ([item.name isEqualToString:@"style"]) {
+			/* (the test's own; the settings' again when it is done) */
+			_map.style = [item.value isEqualToString:@"dark"] ? MapStyleDark : [item.value isEqualToString:@"light"] ?
+			    MapStyleLight : MapStyleSystem;
+		} else if ([item.name isEqualToString:@"names"]) {
+			/* (zh, local, en: the names' language for the test, as the settings would choose it) */
+			_map.labelLanguage = language_for(item.value);
+		} else if ([item.name isEqualToString:@"at"]) {
+			NSArray<NSString *> *at = [item.value componentsSeparatedByString:@","];
+
+			if (at.count >= 2) {
+				latitude = at[0].doubleValue;
+				longitude = at[1].doubleValue;
+			}
+			if (at.count >= 3) {
+				zoom = at[2].doubleValue;
+			}
+		}
+	}
+	/* (each a renderer and its samples a pixel: "all" is both renderers with four and then with one) */
+	if (![renderer isEqualToString:@"metal"]) {
+		[kinds addObject:@(MapRendererKindGL * 10 + 4)];
+	}
+	if (![renderer isEqualToString:@"gl"]) {
+		[kinds addObject:@(MapRendererKindMetal * 10 + 4)];
+	}
+	if ([renderer isEqualToString:@"all"]) {
+		[kinds addObject:@(MapRendererKindGL * 10 + 1)];
+		[kinds addObject:@(MapRendererKindMetal * 10 + 1)];
+	}
+	if (_testing) {
+		NSLog(@"mapcheck: a self-test is running already");
+		return;
+	}
+	_testing = YES;
+	[self follow:FOLLOW_NONE];
+	_placed = YES;
+	[self dismissViewControllerAnimated:NO completion:nil];
+	NSLog(@"mapcheck: self-test of %@ at %.5f, %.5f zoom %.1f; Metal %@", renderer, latitude, longitude, zoom,
+	    map_metal_problem() ?: @"is there");
+	[self test:kinds at:CLLocationCoordinate2DMake(latitude, longitude) zoom:zoom];
+}
+
+- (void)test:(NSMutableArray<NSNumber *> *)kinds at:(CLLocationCoordinate2D)where zoom:(double)zoom
+{
+	__weak MapController *weak = self;
+	MapRendererKind kind;
+	unsigned samples;
+
+	if (kinds.count == 0) {
+		NSLog(@"mapcheck: done");
+		_testing = NO;
+		/* (the map stays as the test left it, its style too, for a screenshot; the settings' renderer again) */
+		{
+			MapStyleChoice style = _map.style;
+			enum style_language names = _map.labelLanguage;
+
+			[self applySettings];
+			_map.style = style;
+			_map.labelLanguage = names;
+		}
+		return;
+	}
+	kind = (MapRendererKind)(kinds.firstObject.integerValue / 10);
+	samples = (unsigned)(kinds.firstObject.integerValue % 10);
+	[kinds removeObjectAtIndex:0];
+	[_map testAt:where zoom:zoom renderer:kind samples:samples done:^(NSArray<NSString *> *lines) {
+		for (NSString *line in lines) {
+			map_say(line);
+		}
+		[weak test:kinds at:where zoom:zoom];
+	}];
 }
 
 - (void)mapViewWillMove:(MapView *)map dragged:(BOOL)dragged
@@ -704,7 +1151,7 @@ languages(void)
 	[_searchTask cancel];
 	_searchTask = nil;
 	_places = nil;
-	_note = @"Searching…";
+	_note = NSLocalizedString(@"Searching…", nil);
 	[self showResults:YES];
 	/* (Nominatim allows one request a second at most: a search sooner than that after the last one waits its turn) */
 	if (wait > 0) {
@@ -749,7 +1196,7 @@ languages(void)
 			}
 			me->_searchTask = nil;
 			me->_places = places;
-			me->_note = problem ?: (places.count == 0 ? @"No places found" : nil);
+			me->_note = problem ?: (places.count == 0 ? NSLocalizedString(@"No places found", nil) : nil);
 			[me showResults:YES];
 		});
 	}];
@@ -841,6 +1288,24 @@ languages(void)
 	self.window.rootViewController = [MapController new];
 	[self.window makeKeyAndVisible];
 	return YES;
+}
+
+/* map://test...: the self-test (after a launch by the URL too: iOS calls this once the launch is done) */
+- (BOOL)application:(UIApplication *)application openURL:(NSURL *)url options:(NSDictionary *)options
+{
+	if ([url.scheme isEqualToString:@"map"] && [url.host isEqualToString:@"test"]) {
+		[(MapController *)self.window.rootViewController runTest:url];
+		return YES;
+	}
+	/* map://settings: the app's own page in iOS's Settings (what Settings.bundle makes), as the system opens it */
+	if ([url.scheme isEqualToString:@"map"] && [url.host isEqualToString:@"settings"]) {
+		[application openURL:[NSURL URLWithString:UIApplicationOpenSettingsURLString] options:@{}
+		    completionHandler:^(BOOL opened) {
+			NSLog(@"mapcheck: the Settings page %@", opened ? @"opened" : @"did NOT open");
+		}];
+		return YES;
+	}
+	return NO;
 }
 
 @end

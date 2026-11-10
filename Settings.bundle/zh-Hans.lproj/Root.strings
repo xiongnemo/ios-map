@@ -1,0 +1,14 @@
+"Drawing" = "绘制";
+"Both draw the same map. Metal is used only where the device lets this app have it; otherwise the map is drawn with OpenGL ES." = "两种方式画出来的地图是一样的。只有设备允许这个 App 用 Metal 时才用 Metal，否则用 OpenGL ES 画。";
+"Renderer" = "渲染器";
+"Show Frame Rate" = "显示帧率";
+"Look" = "外观";
+"Style" = "样式";
+"Follow System" = "跟随系统";
+"Light" = "浅色";
+"Dark" = "深色";
+"Place Names" = "地名语言";
+"Local Names" = "当地名";
+"Chinese First" = "中文优先";
+"English First" = "英文优先";
+"Data" = "数据";
