@@ -9,7 +9,7 @@
 	<key>CFBundleExecutable</key>
 	<string>Map</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.anzupop.com.ios.map</string>
+	<string>com.anzupop.ios.map</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

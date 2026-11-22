@@ -27,7 +27,7 @@
   没有就显示整个世界，第一次定位到之后移到那里
 - 没有网络、没有定位权限、瓦片下载失败都不会崩溃：失败的瓦片是深一点的灰色，15 秒后再试（连续失败等待时间翻倍，最长 5 分钟）
 
-- 包名：`com.anzupop.com.ios.map`
+- 包名：`com.anzupop.ios.map`
 - 最低 iOS 15.0，iPhone，竖屏和横屏
 - 只用 Objective-C 和系统框架（UIKit、Core Animation、Core Graphics、Core Location），`main.m` 和 `MapView.m`，
   没有 storyboard、asset catalog、Swift、MapKit
@@ -47,7 +47,7 @@
 用户默认值 `TileURL` 可以换成别的瓦片服务器，`{z}`、`{x}`、`{y}` 会被替换，例如
 
 ```sh
-defaults write com.anzupop.com.ios.map TileURL 'https://example.org/tiles/{z}/{x}/{y}.png'
+defaults write com.anzupop.ios.map TileURL 'https://example.org/tiles/{z}/{x}/{y}.png'
 ```
 
 换了之后请遵守那个服务器的条款和署名要求（右下角仍然写着 OpenStreetMap）。
