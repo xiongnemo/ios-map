@@ -36,7 +36,7 @@
   地名语言、显示帧率。两边写同一套键，改了当场生效（换渲染器时瓦片的几何留着，交给新的渲染器重新上传）
 - 署名一直显示在右下角：“© OpenFreeMap © OpenMapTiles © OpenStreetMap”，点开可以去三家的版权页
 
-- 包名：`com.anzupop.com.ios.map`，版本 2.0
+- 包名：`com.anzupop.ios.map`，版本 2.0
 - 最低 iOS 15.0，iPhone，竖屏和横屏
 - Objective-C 和 C，系统框架（UIKit、Core Animation、Core Text、Core Location、OpenGL ES、Metal），zlib；
   没有 storyboard、Swift、MapKit
@@ -52,7 +52,7 @@
 | Metal，4 倍多重采样 | 39–40 帧/秒 | 移植的 Metal 在 `-commit` 时逐个绘制调用执行、每个都等 GPU（约 1 ms 一个） |
 
 两种画出来的地图一样（读回的帧 99.3% 有内容）。Metal 需要这个 App 在移植的 Metal 允许名单里
-（启动参数 `metal_apps=com.anzupop.com.ios.map`），否则设置里 Metal 那一项是灰的。移植那边为它修了两处：
+（启动参数 `metal_apps=com.anzupop.ios.map`），否则设置里 Metal 那一项是灰的。移植那边为它修了两处：
 片段着色器里的临时变量被当成写深度而拒绝管线（hakios-alioth 11d331a），以及 GL 上下文刚交过一帧就释放时
 主线程上的一个块读已释放的内存（49d3826、5b7b688）。
 

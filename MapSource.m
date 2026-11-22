@@ -140,7 +140,7 @@ gunzipped(NSData *data)
 	_failedAt = [NSMutableDictionary new];
 	_failures = [NSMutableDictionary new];
 	if (custom.length > 0) {
-		/* (a server of one's own, as the defaults say: `defaults write com.anzupop.com.ios.map TileURL ...`) */
+		/* (a server of one's own, as the defaults say: `defaults write com.anzupop.ios.map TileURL ...`) */
 		_template = custom;
 		_custom = YES;
 	} else {
